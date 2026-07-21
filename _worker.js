@@ -1070,7 +1070,7 @@ function getKeyboardLayout(userSetting) {
         { text: "🗑️ 删除文件", callback_data: "delete_file_input" }
       ],
       [
-        { text: "📦 本项目GitHub地址", url: "https://github.com/iawooo/cftc" }
+        { text: "📦 联系我们", url: "https://t.me/unmihari1" }
       ]
     ]
   };
