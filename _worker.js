@@ -224,7 +224,7 @@ async function recreateUserSettingsTable(config) {
       CREATE TABLE user_settings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id TEXT NOT NULL UNIQUE,
-        storage_type TEXT DEFAULT 'r2',
+        storage_type TEXT DEFAULT 'telegram',
         category_id INTEGER,
         custom_suffix TEXT,
         waiting_for TEXT,
@@ -406,6 +406,7 @@ export default {
       enableAuth: env.ENABLE_AUTH === 'true' || false,
       tgBotToken: env.TG_BOT_TOKEN || '',
       tgChatId: env.TG_CHAT_ID ? env.TG_CHAT_ID.split(",") : [], 
+      tgAdminId: env.TG_ADMIN_ID ? env.TG_ADMIN_ID.split(",") : [],
       tgStorageChatId: env.TG_STORAGE_CHAT_ID || env.TG_CHAT_ID || '',
       cookie: Number(env.COOKIE) || 7,
       maxSizeMB: Number(env.MAX_SIZE_MB) || 20,
@@ -604,8 +605,13 @@ async function handleTelegramWebhook(request, config) {
           defaultCategoryId = defaultCategory.id;
       }
       await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type, current_category_id) VALUES (?, ?, ?)')
-         .bind(chatId, 'r2', defaultCategoryId).run();
-      userSetting = { chat_id: chatId, storage_type: 'r2', current_category_id: defaultCategoryId };
+         .bind(chatId, 'telegram', defaultCategoryId).run();
+      
+      userSetting = { 
+       chat_id: chatId, 
+       storage_type: 'telegram', 
+       current_category_id: defaultCategoryId 
+      };
     }
     if (update.message) {
       if (userSetting.waiting_for === 'new_category' && update.message.text) {
@@ -1058,11 +1064,11 @@ function getKeyboardLayout(userSetting) {
     inline_keyboard: [
       [
         { text: "📤 切换存储", callback_data: "switch_storage" },
-        { text: "📋 选择分类", callback_data: "list_categories" }
+        { text: "📊 R2统计", callback_data: "r2_stats" }
       ],
       [
         { text: "📝 创建分类", callback_data: "create_category" },
-        { text: "📊 R2统计", callback_data: "r2_stats" }
+        { text: "📋 选择分类", callback_data: "list_categories" }
       ],
       [
         { text: "📂 最近文件", callback_data: "recent_files" },
@@ -1129,19 +1135,56 @@ async function handleCallbackQuery(update, config, userSetting) {
       }
     }
     if (cbData === 'switch_storage') {
-      const newStorageType = userSetting.storage_type === 'r2' ? 'telegram' : 'r2';
+      // 管理员权限验证
+      if (
+        config.tgAdminId &&
+        config.tgAdminId.length > 0 &&
+        !config.tgAdminId.includes(chatId)
+      ) {
+        await answerPromise;
+    
+        await sendMessage(
+          chatId,
+          "❌ 你没有权限切换存储模式",
+          config.tgBotToken
+        );
+    
+        return;
+      }
+    
+      const newStorageType =
+        userSetting.storage_type === 'telegram'
+          ? 'r2'
+          : 'telegram';
+    
       await Promise.all([
-        config.database.prepare('UPDATE user_settings SET storage_type = ? WHERE chat_id = ?')
-          .bind(newStorageType, chatId).run(),
+        config.database.prepare(
+          'UPDATE user_settings SET storage_type = ? WHERE chat_id = ?'
+        )
+        .bind(newStorageType, chatId)
+        .run(),
+    
         answerPromise
       ]);
+    
       if (config.buttonCache) {
         config.buttonCache.set(cacheKey, {
           timestamp: Date.now(),
           sendPanel: true
         });
       }
-      await sendPanel(chatId, { ...userSetting, storage_type: newStorageType }, config);
+    
+      await sendMessage(
+        chatId,
+        `✅ 已切换存储模式：${newStorageType === 'r2' ? 'R2对象存储' : 'Telegram存储'}`,
+        config.tgBotToken
+      );
+    
+      await sendPanel(
+        chatId,
+        { ...userSetting, storage_type: newStorageType },
+        config
+      );
     }
     else if (cbData === 'list_categories') {
       const categoriesPromise = config.database.prepare('SELECT id, name FROM categories').all();
@@ -1177,6 +1220,22 @@ async function handleCallbackQuery(update, config, userSetting) {
       });
     }
     else if (cbData === 'create_category') {
+      // 管理员权限验证
+      if (
+        config.tgAdminId &&
+        config.tgAdminId.length > 0 &&
+        !config.tgAdminId.includes(chatId)
+      ) {
+        await answerPromise;
+    
+        await sendMessage(
+          chatId,
+          "❌ 你没有权限创建分类，请联系管理员",
+          config.tgBotToken
+        );
+    
+        return;
+      }
       if (config.buttonCache) {
         config.buttonCache.set(cacheKey, {
           timestamp: Date.now(),
@@ -1186,9 +1245,13 @@ async function handleCallbackQuery(update, config, userSetting) {
       await Promise.all([
         answerPromise,
         sendMessage(chatId, "📝 请回复此消息，输入新分类名称", config.tgBotToken),
-        config.database.prepare('UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?')
-          .bind('new_category', chatId).run()
+        config.database.prepare(
+          'UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?'
+        )
+          .bind('new_category', chatId)
+          .run()
       ]);
+    
       userSetting.waiting_for = 'new_category';
     }
     else if (cbData.startsWith('set_category_')) {
