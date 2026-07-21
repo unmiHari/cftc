@@ -1290,12 +1290,21 @@ async function handleCallbackQuery(update, config, userSetting) {
       }
       await sendPanel(chatId, userSetting, config);
     }
-    else if (cbData === 'r2_stats') {
-      const statsPromise = config.database.prepare(`
-        SELECT COUNT(*) as total_files,
-               SUM(file_size) as total_size
-        FROM files WHERE chat_id = ? AND storage_type = 'r2'
-      `).bind(chatId).first();
+    if (cbData === 'r2_stats') {
+      // 管理员权限验证
+      if (
+        config.tgAdminId &&
+        config.tgAdminId.length > 0 &&
+        !config.tgAdminId.includes(chatId)
+      ) {
+        await answerPromise;
+        await sendMessage(
+          chatId,
+          "❌ 你没有权限查看 R2 统计，请联系管理员",
+          config.tgBotToken
+        );
+        return;
+      }
       await answerPromise;
       const stats = await statsPromise;
       const statsMessage = `📊 您的 R2 存储使用统计
