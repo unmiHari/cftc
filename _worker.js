@@ -860,7 +860,7 @@ async function handleTelegramWebhook(request, config) {
       if (config.tgBotToken) {
         await sendMessage(
           chatId,
-          "❌ 你无权使用，请联系管理员添加你的 Telegram 用户 ID",
+          "❌ 你无权使用，请联系管理员",
           config.tgBotToken
         );
       }
@@ -1431,9 +1431,8 @@ async function generateMainMenu(chatId, userSetting, config) {
     categoryName = categoryResult.name;
   }
   const defaultNotification = 
-    "➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链\n" +
-    "➡️ 所有上传的文件都可以在网页后台管理，支持删除、查看、分类等操作";
-  const messageBody = `☁️ <b>图床助手v1</b>
+    "➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链";
+  const messageBody = `☁️ <b>图床助手v2</b>
   📂 当前存储：${storageText}
   📁 当前分类：${categoryName}
   📊 已上传：${stats && stats.total_files ? stats.total_files : 0} 个文件
