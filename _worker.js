@@ -117,6 +117,34 @@ async function recreateAllTables(config) {
       )
     `).run();
 
+    // 机器人“上传大文件”按钮生成的一次性网页会话。
+    // expires_at 只限制尚未开始的会话；首片上传成功后即使超时也允许继续完成。
+    await config.database.prepare(`
+      CREATE TABLE IF NOT EXISTS bot_upload_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        token_hash TEXT NOT NULL UNIQUE,
+        chat_id TEXT NOT NULL,
+        upload_id TEXT NOT NULL UNIQUE,
+        category_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'pending',
+        file_name TEXT,
+        file_size INTEGER,
+        mime_type TEXT,
+        total_chunks INTEGER NOT NULL DEFAULT 0,
+        uploaded_chunks INTEGER NOT NULL DEFAULT 0,
+        uploaded_bytes INTEGER NOT NULL DEFAULT 0,
+        result_file_id INTEGER,
+        result_url TEXT,
+        error_message TEXT,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        started_at INTEGER,
+        completed_at INTEGER,
+        FOREIGN KEY (category_id) REFERENCES categories(id),
+        FOREIGN KEY (result_file_id) REFERENCES files(id)
+      )
+    `).run();
+
     await config.database.prepare(`
       CREATE INDEX IF NOT EXISTS idx_file_chunks_file_id
       ON file_chunks(file_id, chunk_index)
@@ -125,6 +153,16 @@ async function recreateAllTables(config) {
     await config.database.prepare(`
       CREATE INDEX IF NOT EXISTS idx_file_chunks_upload_id
       ON file_chunks(upload_id, chunk_index)
+    `).run();
+
+    await config.database.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_bot_upload_sessions_chat_status
+      ON bot_upload_sessions(chat_id, status, created_at)
+    `).run();
+
+    await config.database.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_bot_upload_sessions_expires
+      ON bot_upload_sessions(expires_at, status)
     `).run();
 
     await config.database.prepare(`
@@ -144,7 +182,8 @@ async function validateDatabaseStructure(config) {
       'user_settings',
       'allowed_users',
       'files',
-      'file_chunks'
+      'file_chunks',
+      'bot_upload_sessions'
     ];
     for (const table of tables) {
       try {
@@ -209,6 +248,27 @@ async function validateDatabaseStructure(config) {
         { name: 'message_id', type: 'INTEGER' },
         { name: 'chunk_size', type: 'INTEGER' },
         { name: 'created_at', type: 'INTEGER' }
+      ],
+      bot_upload_sessions: [
+        { name: 'id', type: 'INTEGER' },
+        { name: 'token_hash', type: 'TEXT' },
+        { name: 'chat_id', type: 'TEXT' },
+        { name: 'upload_id', type: 'TEXT' },
+        { name: 'category_id', type: 'INTEGER' },
+        { name: 'status', type: 'TEXT' },
+        { name: 'file_name', type: 'TEXT' },
+        { name: 'file_size', type: 'INTEGER' },
+        { name: 'mime_type', type: 'TEXT' },
+        { name: 'total_chunks', type: 'INTEGER' },
+        { name: 'uploaded_chunks', type: 'INTEGER' },
+        { name: 'uploaded_bytes', type: 'INTEGER' },
+        { name: 'result_file_id', type: 'INTEGER' },
+        { name: 'result_url', type: 'TEXT' },
+        { name: 'error_message', type: 'TEXT' },
+        { name: 'created_at', type: 'INTEGER' },
+        { name: 'expires_at', type: 'INTEGER' },
+        { name: 'started_at', type: 'INTEGER' },
+        { name: 'completed_at', type: 'INTEGER' }
       ]
     };
     for (const [table, expectedColumns] of Object.entries(tableStructures)) {
@@ -243,6 +303,14 @@ async function validateDatabaseStructure(config) {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_files_upload_id
       ON files(upload_id)
       WHERE upload_id IS NOT NULL
+    `).run();
+    await config.database.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_bot_upload_sessions_chat_status
+      ON bot_upload_sessions(chat_id, status, created_at)
+    `).run();
+    await config.database.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_bot_upload_sessions_expires
+      ON bot_upload_sessions(expires_at, status)
     `).run();
 
     console.log('检查默认分类...');
@@ -732,6 +800,23 @@ async function setWebhook(webhookUrl, botToken) {
   console.error('多次尝试后仍未能设置webhook');
   return false;
 }
+function createLargeUploadMaintenanceConfig(env) {
+  const tgApiBaseUrl = normalizeTelegramApiRoot(
+    env.TG_BOT_API_BASE_URL || 'https://api.telegram.org'
+  );
+  return {
+    database: env.DATABASE,
+    tgBotToken: env.TG_BOT_TOKEN || '',
+    tgApiBaseUrl,
+    tgFileBaseUrl: normalizeTelegramApiRoot(
+      env.TG_BOT_FILE_BASE_URL || tgApiBaseUrl
+    ),
+    tgStorageChatId: String(env.TG_STORAGE_CHAT_ID || '').trim(),
+    fileCache: new Map(),
+    fileCacheTTL: 3600000
+  };
+}
+
 export default {
   async fetch(request, env, executionCtx) {
     if (!env.DATABASE) {
@@ -754,6 +839,11 @@ export default {
         Boolean(tgFileProxyUrl) ||
         String(env.TG_LOCAL_FILE_ENDPOINT || '').toLowerCase() === 'true'
       );
+
+    const updateTimeMinutes = Math.max(
+      1,
+      Math.floor(Number(env.UPDATE_TIME) || 20)
+    );
 
     const config = {
       domain: env.DOMAIN || request.headers.get("host") || '',
@@ -780,13 +870,16 @@ export default {
         : 20,
       // 公开 Bot API 的 getFile 下载上限仍为 20MB，因此分片必须低于 20MB
       telegramChunkSizeMB: Math.min(19, Math.max(1, Number(env.TG_CHUNK_SIZE_MB) || 19)),
+      // 机器人专属大文件上传页在开始上传前的有效时长，单位：分钟。
+      updateTimeMinutes,
       bucket: env.BUCKET,
       fileCache: new Map(),
       fileCacheTTL: 3600000,
       buttonCache: new Map(),
       buttonCacheTTL: 600000,
       menuCache: new Map(),
-      menuCacheTTL: 300000,
+      // 菜单含临时 URL，缓存最长不超过 UPDATE_TIME 的一半。
+      menuCacheTTL: Math.min(300000, updateTimeMinutes * 30 * 1000),
       notificationCache: '',
       notificationCacheTTL: 3600000,
       lastNotificationFetch: 0
@@ -919,6 +1012,22 @@ export default {
           console.log('[Route] Handling /upload-abort request.');
           return handleUploadAbortRequest(request, config);
       },
+      '/large-upload': async () => {
+          console.log('[Route] Handling /large-upload request.');
+          return handleLargeUploadPageRequest(request, config);
+      },
+      '/large-upload/status': async () => {
+          console.log('[Route] Handling /large-upload/status request.');
+          return handleLargeUploadStatusRequest(request, config);
+      },
+      '/large-upload/chunk': async () => {
+          console.log('[Route] Handling /large-upload/chunk request.');
+          return handleLargeUploadChunkRequest(request, config);
+      },
+      '/large-upload/complete': async () => {
+          console.log('[Route] Handling /large-upload/complete request.');
+          return handleLargeUploadCompleteRequest(request, config);
+      },
       '/admin': async () => {
           console.log('[Route] Handling /admin request.');
           return handleAdminRequest(request, config);
@@ -956,6 +1065,8 @@ export default {
             telegramFileLimitMB: config.telegramFileLimitMB,
             telegramDownloadLimitMB: config.telegramDownloadLimitMB,
             telegramChunkSizeMB: config.telegramChunkSizeMB,
+            updateTimeMinutes: config.updateTimeMinutes,
+            largeUploadChunkTimeoutMinutes: LARGE_UPLOAD_CHUNK_TIMEOUT_MINUTES,
             useLocalBotApi: config.useLocalBotApi,
             allowLargeBotDownloads: config.allowLargeBotDownloads
           };
@@ -993,6 +1104,37 @@ export default {
     }
     console.log(`[File] Handling file request for ${pathname}`);
     return await handleFileRequest(request, config);
+  },
+
+  // 需要在 Cloudflare Workers 中配置 Cron Trigger（建议每分钟执行一次）。
+  // 它保证用户关闭临时网页后，超时任务仍会被自动取消并清理分片。
+  async scheduled(_controller, env, executionCtx) {
+    if (!env.DATABASE) {
+      console.error('[Large Upload Cleanup] 缺少 DATABASE，跳过定时清理');
+      return;
+    }
+    const config = createLargeUploadMaintenanceConfig(env);
+    globalThis.__TG_BOT_API_BASE_URL = config.tgApiBaseUrl;
+    globalThis.__TG_BOT_FILE_BASE_URL = config.tgFileBaseUrl;
+
+    const task = (async () => {
+      await initDatabase(config);
+      const result = await cleanupStaleLargeUploadSessions(config);
+      if (result.cancelled > 0) {
+        console.log(
+          `[Large Upload Cleanup] 已取消 ${result.cancelled} 个超时任务，` +
+          `删除 ${result.deletedChunks} 个分片`
+        );
+      }
+    })().catch(error => {
+      console.error('[Large Upload Cleanup] 定时清理失败:', error);
+    });
+
+    if (executionCtx && typeof executionCtx.waitUntil === 'function') {
+      executionCtx.waitUntil(task);
+      return;
+    }
+    await task;
   }
 };
 async function handleTelegramWebhook(request, config, executionCtx = null) {
@@ -1808,10 +1950,20 @@ async function generateMainMenu(chatId, userSetting, config) {
     }
     return config.notificationCache;
   })();
-  const [categoryResult, stats, notificationText] = await Promise.all([
+  const largeUploadSessionPromise = createLargeUploadSession(
+    chatId,
+    userSetting,
+    config
+  ).catch(error => {
+    console.error('创建大文件上传临时页面失败:', error);
+    return null;
+  });
+
+  const [categoryResult, stats, notificationText, largeUploadSession] = await Promise.all([
     categoryPromise,
     statsPromise,
-    notificationPromise
+    notificationPromise,
+    largeUploadSessionPromise
   ]);
   if (categoryResult) {
     categoryName = categoryResult.name;
@@ -1823,23 +1975,35 @@ async function generateMainMenu(chatId, userSetting, config) {
   📁 当前分类：${categoryName}
   📊 已上传：${stats && stats.total_files ? stats.total_files : 0} 个文件
   💾 已用空间：${formatSize(stats && stats.total_size ? stats.total_size : 0)}
+  📤 超出20MB请使用上传大文件
   ${notificationText || defaultNotification}
   👇 请选择操作：`;
   const keyboard = getKeyboardLayout(
     userSetting,
-    isTelegramAdmin(chatId, config)
+    isTelegramAdmin(chatId, config),
+    largeUploadSession && largeUploadSession.url
   );
   return { messageBody, keyboard };
 }
-function getKeyboardLayout(userSetting, isAdmin = false) {
-  const rows = [
-    [
+function getKeyboardLayout(userSetting, isAdmin = false, largeUploadUrl = '') {
+  const rows = [];
+
+  // URL 按钮可在一次点击后直接打开专属页面；链接由菜单生成时临时创建。
+  if (largeUploadUrl) {
+    rows.push([
       {
-        text: "📋 选择分类",
-        callback_data: "list_categories"
+        text: "📤 上传大文件",
+        url: largeUploadUrl
       }
-    ]
-  ];
+    ]);
+  }
+
+  rows.push([
+    {
+      text: "📋 选择分类",
+      callback_data: "list_categories"
+    }
+  ]);
 
   // 仅管理员显示用户管理按钮
   if (isAdmin) {
@@ -4046,6 +4210,646 @@ async function handleDeleteCategoryRequest(request, config) {
     });
   }
 }
+
+const LARGE_UPLOAD_SESSION_STATUS = Object.freeze({
+  PENDING: 'pending',
+  UPLOADING: 'uploading',
+  FINALIZING: 'finalizing',
+  COMPLETED: 'completed',
+  CANCELLED: 'cancelled',
+  FAILED: 'failed'
+});
+
+// 相邻两个成功分片之间最多允许间隔 10 分钟。
+// 该值按需求固定，不受 UPDATE_TIME（临时页面入口有效期）影响。
+const LARGE_UPLOAD_CHUNK_TIMEOUT_MINUTES = 10;
+const LARGE_UPLOAD_CHUNK_TIMEOUT_MS =
+  LARGE_UPLOAD_CHUNK_TIMEOUT_MINUTES * 60 * 1000;
+
+function getPublicOrigin(config) {
+  const value = String(config && config.domain || '').trim().replace(/\/+$/, '');
+  if (/^https?:\/\//i.test(value)) return value;
+  return `https://${value}`;
+}
+
+function createSecureTokenHex(byteLength = 32) {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
+}
+
+function normalizeLargeUploadToken(value) {
+  const token = String(value || '').trim().toLowerCase();
+  return /^[a-f0-9]{64}$/.test(token) ? token : null;
+}
+
+async function sha256Hex(value) {
+  const data = new TextEncoder().encode(String(value || ''));
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function getLargeUploadSessionByToken(token, config) {
+  const validToken = normalizeLargeUploadToken(token);
+  if (!validToken) return null;
+  const tokenHash = await sha256Hex(validToken);
+  return config.database.prepare(`
+    SELECT *
+    FROM bot_upload_sessions
+    WHERE token_hash = ?
+    LIMIT 1
+  `).bind(tokenHash).first();
+}
+
+function isLargeUploadSessionExpired(session) {
+  return !session || Number(session.expires_at || 0) <= Date.now();
+}
+
+function mayContinueLargeUploadSession(session) {
+  if (!session) return false;
+  return [
+    LARGE_UPLOAD_SESSION_STATUS.UPLOADING,
+    LARGE_UPLOAD_SESSION_STATUS.FINALIZING,
+    LARGE_UPLOAD_SESSION_STATUS.COMPLETED
+  ].includes(String(session.status || ''));
+}
+
+function isLargeUploadSessionCancelled(session) {
+  return Boolean(
+    session &&
+    String(session.status || '') === LARGE_UPLOAD_SESSION_STATUS.CANCELLED
+  );
+}
+
+async function createLargeUploadSession(chatId, userSetting, config) {
+  const token = createSecureTokenHex(32);
+  const tokenHash = await sha256Hex(token);
+  const uploadId = crypto.randomUUID().replace(/-/g, '_');
+  const now = Date.now();
+  const expiresAt = now + Number(config.updateTimeMinutes || 20) * 60 * 1000;
+  const categoryId = Number(userSetting && userSetting.current_category_id) || null;
+
+  // 每次重新发送主菜单时废弃该用户尚未开始的旧入口；已开始/已完成任务不受影响。
+  await config.database.prepare(`
+    DELETE FROM bot_upload_sessions
+    WHERE chat_id = ? AND status = ?
+  `).bind(chatId, LARGE_UPLOAD_SESSION_STATUS.PENDING).run();
+
+  await config.database.prepare(`
+    INSERT INTO bot_upload_sessions (
+      token_hash, chat_id, upload_id, category_id, status,
+      created_at, expires_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    tokenHash,
+    String(chatId),
+    uploadId,
+    categoryId,
+    LARGE_UPLOAD_SESSION_STATUS.PENDING,
+    now,
+    expiresAt
+  ).run();
+
+  return {
+    token,
+    uploadId,
+    expiresAt,
+    url: `${getPublicOrigin(config)}/large-upload?token=${encodeURIComponent(token)}`
+  };
+}
+
+function largeUploadJson(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json;charset=UTF-8',
+      'Cache-Control': 'no-store'
+    }
+  });
+}
+
+function getLargeUploadTokenFromRequest(request, bodyOrForm = null) {
+  const requestUrl = new URL(request.url);
+  return normalizeLargeUploadToken(
+    requestUrl.searchParams.get('token') ||
+    (bodyOrForm && typeof bodyOrForm.get === 'function' ? bodyOrForm.get('token') : null) ||
+    (bodyOrForm && bodyOrForm.token)
+  );
+}
+
+async function getLargeUploadProgress(session, config) {
+  const result = await config.database.prepare(`
+    SELECT
+      COUNT(*) AS uploaded_chunks,
+      COALESCE(SUM(chunk_size), 0) AS uploaded_bytes,
+      MAX(created_at) AS last_chunk_at
+    FROM file_chunks
+    WHERE upload_id = ? AND chat_id = ?
+  `).bind(session.upload_id, session.chat_id).first();
+
+  const indexesResult = await config.database.prepare(`
+    SELECT chunk_index
+    FROM file_chunks
+    WHERE upload_id = ? AND chat_id = ?
+    ORDER BY chunk_index ASC
+  `).bind(session.upload_id, session.chat_id).all();
+
+  return {
+    uploadedChunks: Number(result && result.uploaded_chunks || 0),
+    uploadedBytes: Number(result && result.uploaded_bytes || 0),
+    uploadedIndexes: (indexesResult.results || []).map(row => Number(row.chunk_index)),
+    lastChunkAt: Number(result && result.last_chunk_at || 0)
+  };
+}
+
+async function cancelLargeUploadSessionForChunkTimeout(session, config) {
+  if (!session || String(session.status || '') !== LARGE_UPLOAD_SESSION_STATUS.UPLOADING) {
+    return { session, cancelled: false, deletedChunks: 0 };
+  }
+
+  const progress = await getLargeUploadProgress(session, config);
+  const totalChunks = Number(session.total_chunks || 0);
+
+  // 未成功上传首片时由 UPDATE_TIME 控制入口有效期；所有分片都已到齐时
+  // 不再执行“分片间隔”取消，允许进入最终生成直链阶段。
+  if (
+    progress.uploadedChunks <= 0 ||
+    !progress.lastChunkAt ||
+    (totalChunks > 0 && progress.uploadedChunks >= totalChunks) ||
+    Date.now() - progress.lastChunkAt <= LARGE_UPLOAD_CHUNK_TIMEOUT_MS
+  ) {
+    return { session, cancelled: false, deletedChunks: 0, progress };
+  }
+
+  const reason =
+    `相邻分片上传间隔超过 ${LARGE_UPLOAD_CHUNK_TIMEOUT_MINUTES} 分钟，` +
+    '任务已取消，已上传分片已删除。';
+
+  // 先原子地把任务改为 cancelled，阻止并发的下一片或完成请求继续落库。
+  const updateResult = await config.database.prepare(`
+    UPDATE bot_upload_sessions
+    SET status = ?, error_message = ?, uploaded_chunks = 0, uploaded_bytes = 0
+    WHERE id = ? AND status = ?
+  `).bind(
+    LARGE_UPLOAD_SESSION_STATUS.CANCELLED,
+    reason,
+    session.id,
+    LARGE_UPLOAD_SESSION_STATUS.UPLOADING
+  ).run();
+
+  if (!updateResult.meta || Number(updateResult.meta.changes || 0) <= 0) {
+    const current = await config.database.prepare(
+      'SELECT * FROM bot_upload_sessions WHERE id = ? LIMIT 1'
+    ).bind(session.id).first();
+    return { session: current || session, cancelled: false, deletedChunks: 0 };
+  }
+
+  // 删除该 upload_id 下尚未绑定正式文件的全部 Telegram 分片与 D1 记录。
+  const deletedChunks = await abortPendingChunkUpload(
+    session.upload_id,
+    session.chat_id,
+    config
+  );
+
+  const cancelledSession = await config.database.prepare(
+    'SELECT * FROM bot_upload_sessions WHERE id = ? LIMIT 1'
+  ).bind(session.id).first();
+
+  // 页面即使已经关闭，也通过机器人明确告知任务已被取消。
+  try {
+    await sendMessage(
+      session.chat_id,
+      `⏱️ <b>大文件上传任务已取消</b>
+
+` +
+      `原因：两个分片间隔超过 ${LARGE_UPLOAD_CHUNK_TIMEOUT_MINUTES} 分钟
+` +
+      `已清理分片：${deletedChunks} 个
+
+` +
+      '请重新点击“上传大文件”创建新任务。',
+      config.tgBotToken
+    );
+  } catch (notifyError) {
+    console.warn('发送大文件超时取消通知失败:', notifyError.message);
+  }
+
+  return {
+    session: cancelledSession || { ...session, status: LARGE_UPLOAD_SESSION_STATUS.CANCELLED, error_message: reason },
+    cancelled: true,
+    deletedChunks
+  };
+}
+
+async function enforceLargeUploadChunkTimeout(session, config) {
+  const result = await cancelLargeUploadSessionForChunkTimeout(session, config);
+  return result.session || session;
+}
+
+// 供 Cloudflare Cron Trigger 使用。网页关闭后仍能自动清理超过 10 分钟
+// 没有继续上传下一片的任务。
+async function cleanupStaleLargeUploadSessions(config, limit = 100) {
+  const cutoff = Date.now() - LARGE_UPLOAD_CHUNK_TIMEOUT_MS;
+  const result = await config.database.prepare(`
+    SELECT s.*
+    FROM bot_upload_sessions s
+    WHERE s.status = ?
+      AND s.total_chunks > 0
+      AND (
+        SELECT COUNT(*)
+        FROM file_chunks c
+        WHERE c.upload_id = s.upload_id
+          AND c.chat_id = s.chat_id
+          AND c.file_id IS NULL
+      ) > 0
+      AND (
+        SELECT COUNT(*)
+        FROM file_chunks c
+        WHERE c.upload_id = s.upload_id
+          AND c.chat_id = s.chat_id
+          AND c.file_id IS NULL
+      ) < s.total_chunks
+      AND (
+        SELECT MAX(c.created_at)
+        FROM file_chunks c
+        WHERE c.upload_id = s.upload_id
+          AND c.chat_id = s.chat_id
+          AND c.file_id IS NULL
+      ) < ?
+    ORDER BY s.id ASC
+    LIMIT ?
+  `).bind(
+    LARGE_UPLOAD_SESSION_STATUS.UPLOADING,
+    cutoff,
+    Math.max(1, Number(limit || 100))
+  ).all();
+
+  let cancelled = 0;
+  let deletedChunks = 0;
+  for (const session of result.results || []) {
+    const cleanup = await cancelLargeUploadSessionForChunkTimeout(session, config);
+    if (cleanup.cancelled) {
+      cancelled += 1;
+      deletedChunks += Number(cleanup.deletedChunks || 0);
+    }
+  }
+  return { cancelled, deletedChunks };
+}
+
+async function buildLargeUploadStatusPayload(session, config) {
+  const progress = await getLargeUploadProgress(session, config);
+  const fileSize = Number(session.file_size || 0);
+  const percent = fileSize > 0
+    ? Math.min(100, Math.round(progress.uploadedBytes / fileSize * 10000) / 100)
+    : 0;
+  const cancelled = isLargeUploadSessionCancelled(session);
+  const chunkDeadlineAt =
+    progress.lastChunkAt > 0 &&
+    progress.uploadedChunks > 0 &&
+    progress.uploadedChunks < Number(session.total_chunks || 0)
+      ? progress.lastChunkAt + LARGE_UPLOAD_CHUNK_TIMEOUT_MS
+      : 0;
+
+  return {
+    status: String(session.status || LARGE_UPLOAD_SESSION_STATUS.PENDING),
+    expired: isLargeUploadSessionExpired(session),
+    cancelled,
+    closePage: cancelled,
+    canStart:
+      !cancelled &&
+      (!isLargeUploadSessionExpired(session) || mayContinueLargeUploadSession(session)),
+    expiresAt: Number(session.expires_at || 0),
+    fileName: session.file_name || '',
+    fileSize,
+    mimeType: session.mime_type || '',
+    totalChunks: Number(session.total_chunks || 0),
+    uploadedChunks: progress.uploadedChunks,
+    uploadedBytes: progress.uploadedBytes,
+    uploadedIndexes: progress.uploadedIndexes,
+    lastChunkAt: progress.lastChunkAt,
+    chunkDeadlineAt,
+    chunkTimeoutMinutes: LARGE_UPLOAD_CHUNK_TIMEOUT_MINUTES,
+    progress: percent,
+    resultUrl: session.result_url || '',
+    error: session.error_message || ''
+  };
+}
+
+async function handleLargeUploadPageRequest(request, config) {
+  if (request.method !== 'GET') {
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  const token = getLargeUploadTokenFromRequest(request);
+  let session = await getLargeUploadSessionByToken(token, config);
+  if (!session) {
+    return new Response(generateLargeUploadMessagePage(
+      '上传页面无效',
+      '该上传链接不存在或已被新的链接替换，请返回机器人重新点击“上传大文件”。'
+    ), {
+      status: 404,
+      headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' }
+    });
+  }
+
+  session = await enforceLargeUploadChunkTimeout(session, config);
+
+  // UPDATE_TIME 只限制仍未开始的入口。cancelled 会继续返回完整页面，
+  // 由前端显示取消原因并主动关闭，而不是被误判成普通过期页。
+  if (
+    String(session.status || '') === LARGE_UPLOAD_SESSION_STATUS.PENDING &&
+    isLargeUploadSessionExpired(session)
+  ) {
+    return new Response(generateLargeUploadMessagePage(
+      '上传页面已过期',
+      `该页面在创建后 ${Number(config.updateTimeMinutes || 20)} 分钟内未开始上传，请返回机器人重新生成。`
+    ), {
+      status: 410,
+      headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' }
+    });
+  }
+
+  const categories = await config.database.prepare(`
+    SELECT id, name
+    FROM categories
+    ORDER BY CASE WHEN name = '默认分类' THEN 0 ELSE 1 END, id ASC
+  `).all();
+  const categoryOptions = (categories.results || []).map(category => {
+    const selected = Number(category.id) === Number(session.category_id) ? ' selected' : '';
+    return `<option value="${Number(category.id)}"${selected}>${escapeHtml(category.name)}</option>`;
+  }).join('');
+  const statusPayload = await buildLargeUploadStatusPayload(session, config);
+
+  return new Response(generateLargeUploadPage({
+    token,
+    categoryOptions,
+    statusPayload,
+    chunkSizeBytes: getTelegramChunkSizeBytes(config),
+    maxSizeBytes: Number(config.maxSizeMB || 1024) * 1024 * 1024,
+    updateTimeMinutes: Number(config.updateTimeMinutes || 20)
+  }), {
+    headers: {
+      'Content-Type': 'text/html;charset=UTF-8',
+      'Cache-Control': 'no-store, no-cache, must-revalidate'
+    }
+  });
+}
+
+async function handleLargeUploadStatusRequest(request, config) {
+  if (request.method !== 'GET') {
+    return largeUploadJson({ status: 0, error: '只支持 GET' }, 405);
+  }
+  const token = getLargeUploadTokenFromRequest(request);
+  let session = await getLargeUploadSessionByToken(token, config);
+  if (!session) return largeUploadJson({ status: 0, error: '上传会话不存在' }, 404);
+  session = await enforceLargeUploadChunkTimeout(session, config);
+  return largeUploadJson({
+    status: 1,
+    session: await buildLargeUploadStatusPayload(session, config)
+  });
+}
+
+async function resolveLargeUploadCategory(categoryValue, session, config) {
+  let categoryId = Number(categoryValue || session.category_id || 0);
+  if (Number.isInteger(categoryId) && categoryId > 0) {
+    const category = await config.database.prepare(
+      'SELECT id FROM categories WHERE id = ? LIMIT 1'
+    ).bind(categoryId).first();
+    if (category) return Number(category.id);
+  }
+  const defaultCategory = await config.database.prepare(
+    'SELECT id FROM categories WHERE name = ? LIMIT 1'
+  ).bind('默认分类').first();
+  return defaultCategory ? Number(defaultCategory.id) : null;
+}
+
+async function handleLargeUploadChunkRequest(request, config) {
+  if (request.method !== 'POST') {
+    return largeUploadJson({ status: 0, error: '只支持 POST' }, 405);
+  }
+
+  try {
+    const formData = await request.formData();
+    const token = getLargeUploadTokenFromRequest(request, formData);
+    let session = await getLargeUploadSessionByToken(token, config);
+    if (!session) throw new Error('上传会话不存在');
+    session = await enforceLargeUploadChunkTimeout(session, config);
+    if (isLargeUploadSessionCancelled(session)) {
+      return largeUploadJson({
+        status: 0,
+        cancelled: true,
+        closePage: true,
+        error: session.error_message || '上传任务已取消'
+      }, 410);
+    }
+    if (session.status === LARGE_UPLOAD_SESSION_STATUS.COMPLETED) {
+      return largeUploadJson({ status: 1, completed: true, url: session.result_url });
+    }
+    if (isLargeUploadSessionExpired(session) && !mayContinueLargeUploadSession(session)) {
+      throw new Error('上传页面已过期，请返回机器人重新生成');
+    }
+
+    const chunk = formData.get('chunk');
+    const chunkIndex = Number(formData.get('chunk_index'));
+    const totalChunks = Number(formData.get('total_chunks'));
+    const fileName = sanitizeTelegramFileName(formData.get('file_name'), 'large-file.bin');
+    const fileSize = Number(formData.get('file_size') || 0);
+    const mimeType = String(formData.get('mime_type') || 'application/octet-stream');
+    const categoryId = await resolveLargeUploadCategory(formData.get('category'), session, config);
+    const maxChunkSize = getTelegramChunkSizeBytes(config);
+
+    if (!chunk || typeof chunk.slice !== 'function') throw new Error('缺少分片数据');
+    if (!Number.isInteger(chunkIndex) || chunkIndex < 0) throw new Error('chunk_index 无效');
+    if (!Number.isInteger(totalChunks) || totalChunks < 1 || chunkIndex >= totalChunks) {
+      throw new Error('total_chunks 无效');
+    }
+    if (fileSize <= 0 || fileSize > Number(config.maxSizeMB) * 1024 * 1024) {
+      throw new Error(`文件超过${config.maxSizeMB}MB限制或大小无效`);
+    }
+    if (totalChunks !== Math.ceil(fileSize / maxChunkSize)) {
+      throw new Error('total_chunks 与文件大小不匹配');
+    }
+    const expectedChunkSize = chunkIndex < totalChunks - 1
+      ? maxChunkSize
+      : fileSize - maxChunkSize * (totalChunks - 1);
+    if (Number(chunk.size) !== expectedChunkSize) {
+      throw new Error(`第 ${chunkIndex + 1} 片大小不正确`);
+    }
+
+    if (session.status === LARGE_UPLOAD_SESSION_STATUS.PENDING) {
+      await config.database.prepare(`
+        UPDATE bot_upload_sessions
+        SET status = ?, category_id = ?, file_name = ?, file_size = ?,
+            mime_type = ?, total_chunks = ?, started_at = ?, error_message = NULL
+        WHERE id = ? AND status = ?
+      `).bind(
+        LARGE_UPLOAD_SESSION_STATUS.UPLOADING,
+        categoryId,
+        fileName,
+        fileSize,
+        mimeType,
+        totalChunks,
+        Date.now(),
+        session.id,
+        LARGE_UPLOAD_SESSION_STATUS.PENDING
+      ).run();
+      session = await config.database.prepare(
+        'SELECT * FROM bot_upload_sessions WHERE id = ? LIMIT 1'
+      ).bind(session.id).first();
+    } else {
+      if (String(session.file_name || '') !== fileName || Number(session.file_size) !== fileSize) {
+        throw new Error('所选文件与当前上传会话中的文件不一致');
+      }
+      if (Number(session.total_chunks) !== totalChunks) {
+        throw new Error('分片数量与当前上传会话不一致');
+      }
+    }
+
+    await uploadOneTelegramChunk(
+      chunk,
+      session.upload_id,
+      chunkIndex,
+      totalChunks,
+      fileName,
+      session.chat_id,
+      config
+    );
+
+    // 上传 Telegram 分片期间，状态轮询或 Cron 可能刚好触发超时取消。
+    // 再次检查并清理刚刚完成的孤立分片，确保取消后不会残留。
+    session = await config.database.prepare(
+      'SELECT * FROM bot_upload_sessions WHERE id = ? LIMIT 1'
+    ).bind(session.id).first();
+    if (isLargeUploadSessionCancelled(session)) {
+      await abortPendingChunkUpload(session.upload_id, session.chat_id, config);
+      return largeUploadJson({
+        status: 0,
+        cancelled: true,
+        closePage: true,
+        error: session.error_message || '上传任务已取消'
+      }, 410);
+    }
+
+    const progress = await getLargeUploadProgress(session, config);
+    await config.database.prepare(`
+      UPDATE bot_upload_sessions
+      SET uploaded_chunks = ?, uploaded_bytes = ?, error_message = NULL
+      WHERE id = ?
+    `).bind(progress.uploadedChunks, progress.uploadedBytes, session.id).run();
+
+    return largeUploadJson({
+      status: 1,
+      chunkIndex,
+      uploadedChunks: progress.uploadedChunks,
+      uploadedBytes: progress.uploadedBytes,
+      totalChunks,
+      progress: Math.min(100, Math.round(progress.uploadedBytes / fileSize * 10000) / 100)
+    });
+  } catch (error) {
+    console.error('[Large Upload Chunk Error]', error);
+    return largeUploadJson({ status: 0, error: error.message }, 400);
+  }
+}
+
+async function handleLargeUploadCompleteRequest(request, config) {
+  if (request.method !== 'POST') {
+    return largeUploadJson({ status: 0, error: '只支持 POST' }, 405);
+  }
+
+  let session = null;
+  try {
+    const body = await request.json();
+    const token = getLargeUploadTokenFromRequest(request, body);
+    session = await getLargeUploadSessionByToken(token, config);
+    if (!session) throw new Error('上传会话不存在');
+    session = await enforceLargeUploadChunkTimeout(session, config);
+    if (isLargeUploadSessionCancelled(session)) {
+      return largeUploadJson({
+        status: 0,
+        cancelled: true,
+        closePage: true,
+        error: session.error_message || '上传任务已取消'
+      }, 410);
+    }
+    if (session.status === LARGE_UPLOAD_SESSION_STATUS.COMPLETED) {
+      return largeUploadJson({ status: 1, completed: true, url: session.result_url });
+    }
+    if (![LARGE_UPLOAD_SESSION_STATUS.UPLOADING, LARGE_UPLOAD_SESSION_STATUS.FINALIZING].includes(session.status)) {
+      throw new Error('上传尚未开始或当前状态不可完成');
+    }
+
+    await config.database.prepare(`
+      UPDATE bot_upload_sessions
+      SET status = ?, error_message = NULL
+      WHERE id = ?
+    `).bind(LARGE_UPLOAD_SESSION_STATUS.FINALIZING, session.id).run();
+
+    const file = await finalizeChunkedTelegramUpload({
+      uploadId: session.upload_id,
+      chatId: session.chat_id,
+      fileName: session.file_name,
+      fileSize: Number(session.file_size),
+      mimeType: session.mime_type || 'application/octet-stream',
+      categoryId: session.category_id || null,
+      key: generateSafeKey(session.file_name),
+      totalChunks: Number(session.total_chunks)
+    }, config);
+
+    const completedAt = Date.now();
+    await config.database.prepare(`
+      UPDATE bot_upload_sessions
+      SET status = ?, result_file_id = ?, result_url = ?,
+          uploaded_chunks = total_chunks, uploaded_bytes = file_size,
+          completed_at = ?, error_message = NULL
+      WHERE id = ?
+    `).bind(
+      LARGE_UPLOAD_SESSION_STATUS.COMPLETED,
+      file.id,
+      file.url,
+      completedAt,
+      session.id
+    ).run();
+
+    // 即使用户已经关闭临时网页，也会在机器人会话中收到永久直链。
+    try {
+      await sendMessage(
+        session.chat_id,
+        `✅ <b>大文件上传完成</b>\n\n` +
+        `📄 文件：${escapeHtml(session.file_name)}\n` +
+        `📦 大小：${formatSize(Number(session.file_size || 0))}\n` +
+        `🧩 分片：${Number(session.total_chunks || 0)}\n\n` +
+        `🔗 ${escapeHtml(file.url)}`,
+        config.tgBotToken
+      );
+    } catch (notifyError) {
+      console.warn('发送大文件完成通知失败:', notifyError.message);
+    }
+
+    return largeUploadJson({
+      status: 1,
+      completed: true,
+      url: file.url,
+      fileName: session.file_name,
+      fileSize: Number(session.file_size || 0),
+      chunkCount: Number(session.total_chunks || 0)
+    });
+  } catch (error) {
+    console.error('[Large Upload Complete Error]', error);
+    if (session && session.id) {
+      await config.database.prepare(`
+        UPDATE bot_upload_sessions
+        SET status = ?, error_message = ?
+        WHERE id = ?
+      `).bind(
+        LARGE_UPLOAD_SESSION_STATUS.UPLOADING,
+        String(error.message || '完成上传失败').slice(0, 500),
+        session.id
+      ).run().catch(() => null);
+    }
+    return largeUploadJson({ status: 0, error: error.message }, 400);
+  }
+}
+
 async function handleUploadRequest(request, config) {
   if (config.enableAuth && !authenticate(request, config)) {
     return Response.redirect(`${new URL(request.url).origin}/`, 302);
@@ -5395,6 +6199,444 @@ function generateLoginPage() {
   </body>
   </html>`;
 }
+
+function generateLargeUploadMessagePage(title, message) {
+  return `<!DOCTYPE html>
+  <html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${escapeHtml(title)}</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 20px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: linear-gradient(135deg, #eef4ff, #f7f9fc); color: #1f2937; }
+      .card { width: min(520px, 100%); padding: 30px; border-radius: 18px; background: #fff;
+        box-shadow: 0 18px 50px rgba(15, 23, 42, .12); text-align: center; }
+      h1 { margin: 0 0 14px; font-size: 24px; }
+      p { margin: 0; line-height: 1.7; color: #64748b; }
+    </style>
+  </head>
+  <body><main class="card"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></main></body>
+  </html>`;
+}
+
+function generateLargeUploadPage({
+  token,
+  categoryOptions,
+  statusPayload,
+  chunkSizeBytes,
+  maxSizeBytes,
+  updateTimeMinutes
+}) {
+  const tokenJson = JSON.stringify(token);
+  const statusJson = JSON.stringify(statusPayload).replace(/</g, '\\u003c');
+  return `<!DOCTYPE html>
+  <html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="机器人专属大文件分片上传页面">
+    <title>上传大文件</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; padding: 20px; display: flex; align-items: center; justify-content: center;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+        color: #172033; background: linear-gradient(135deg, #eef5ff 0%, #f7f9fc 55%, #eaf7f5 100%); }
+      .container { width: min(760px, 100%); background: rgba(255,255,255,.97); border-radius: 20px;
+        box-shadow: 0 22px 60px rgba(30, 41, 59, .14); padding: clamp(20px, 4vw, 36px); }
+      h1 { margin: 0 0 8px; font-size: clamp(25px, 5vw, 34px); }
+      .subtitle { margin: 0 0 24px; color: #64748b; line-height: 1.6; }
+      .notice { margin-bottom: 20px; padding: 12px 14px; border-radius: 12px; background: #fff7ed;
+        color: #9a3412; font-size: 14px; line-height: 1.55; }
+      label { display: block; margin-bottom: 8px; font-weight: 650; }
+      select, input[type="text"] { width: 100%; height: 46px; border: 1px solid #d7deea; border-radius: 11px;
+        padding: 0 13px; background: #fff; font-size: 15px; outline: none; }
+      select:focus, input[type="text"]:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,.12); }
+      .field { margin-bottom: 20px; }
+      .upload-area { position: relative; min-height: 180px; border: 2px dashed #9fb0c8; border-radius: 16px;
+        display: grid; place-items: center; padding: 24px; text-align: center; background: #f8fafc;
+        transition: .2s ease; cursor: pointer; }
+      .upload-area.dragover { border-color: #2563eb; background: #eff6ff; transform: translateY(-1px); }
+      .upload-area.disabled { opacity: .55; pointer-events: none; }
+      .upload-icon { font-size: 38px; margin-bottom: 8px; }
+      .upload-title { font-size: 17px; font-weight: 700; margin-bottom: 6px; }
+      .upload-hint { color: #64748b; font-size: 14px; line-height: 1.5; }
+      #fileInput { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
+      .file-card { display: none; margin-top: 16px; padding: 14px; border: 1px solid #dbe4f0;
+        border-radius: 13px; background: #fff; }
+      .file-name { font-weight: 700; overflow-wrap: anywhere; }
+      .file-meta { color: #64748b; font-size: 13px; margin-top: 4px; }
+      .progress-wrap { display: none; margin-top: 20px; }
+      .progress-head { display: flex; justify-content: space-between; gap: 14px; margin-bottom: 8px; font-size: 14px; }
+      .progress-bar { height: 18px; background: #e7edf5; border-radius: 999px; overflow: hidden; }
+      .progress-track { height: 100%; width: 0; border-radius: inherit;
+        background: linear-gradient(90deg, #2563eb, #06b6d4); transition: width .18s ease; }
+      .progress-detail { margin-top: 9px; color: #64748b; font-size: 13px; line-height: 1.55; }
+      .status { display: none; margin-top: 18px; padding: 12px 14px; border-radius: 11px; line-height: 1.55; }
+      .status.info { display: block; color: #1e40af; background: #eff6ff; }
+      .status.error { display: block; color: #991b1b; background: #fef2f2; }
+      .status.success { display: block; color: #166534; background: #f0fdf4; }
+      .result { margin-top: 24px; }
+      .result-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+      button { height: 46px; border: 0; border-radius: 11px; padding: 0 18px; font-weight: 700; cursor: pointer;
+        color: #fff; background: #2563eb; }
+      button:disabled { opacity: .55; cursor: not-allowed; }
+      .footer { margin-top: 20px; color: #94a3b8; font-size: 12px; line-height: 1.6; text-align: center; }
+      @media (max-width: 560px) { .result-row { grid-template-columns: 1fr; } button { width: 100%; } }
+    </style>
+  </head>
+  <body>
+    <main class="container">
+      <h1>📤 上传大文件</h1>
+      <p class="subtitle">机器人专属临时页面 · 浏览器将文件按 ${Math.round(chunkSizeBytes / 1024 / 1024)} MB 分片保存到 Telegram。</p>
+      <div class="notice">页面在尚未开始上传时有效 ${Number(updateTimeMinutes)} 分钟。首个分片成功后不再受该时限影响；关闭页面不会删除已上传分片，完成后机器人也会发送永久直链。</div>
+
+      <div class="field">
+        <label for="categorySelect">选择分类</label>
+        <select id="categorySelect">${categoryOptions || '<option value="">默认分类</option>'}</select>
+      </div>
+
+      <div id="uploadArea" class="upload-area">
+        <input id="fileInput" type="file">
+        <div>
+          <div class="upload-icon">☁️</div>
+          <div class="upload-title">点击选择文件，或拖放到这里</div>
+          <div class="upload-hint">最大允许 ${Math.round(maxSizeBytes / 1024 / 1024)} MB；推荐用于超过 20 MB 的文件</div>
+        </div>
+      </div>
+
+      <div id="fileCard" class="file-card">
+        <div id="fileName" class="file-name"></div>
+        <div id="fileMeta" class="file-meta"></div>
+      </div>
+
+      <section id="progressWrap" class="progress-wrap">
+        <div class="progress-head"><span id="progressLabel">准备上传</span><strong id="progressPercent">0%</strong></div>
+        <div class="progress-bar"><div id="progressTrack" class="progress-track"></div></div>
+        <div id="progressDetail" class="progress-detail"></div>
+      </section>
+
+      <div id="statusBox" class="status"></div>
+
+      <section class="result">
+        <label for="resultUrl">返回直链</label>
+        <div class="result-row">
+          <input id="resultUrl" type="text" readonly placeholder="上传完成后将在这里显示直链">
+          <button id="copyButton" type="button" disabled>复制直链</button>
+        </div>
+      </section>
+      <div class="footer">临时页面失效或会话记录被清理，不会删除已经生成的文件和直链。</div>
+    </main>
+
+    <script>
+      const TOKEN = ${tokenJson};
+      const INITIAL_STATUS = ${statusJson};
+      const CHUNK_SIZE = ${Number(chunkSizeBytes)};
+      const MAX_SIZE = ${Number(maxSizeBytes)};
+      const uploadArea = document.getElementById('uploadArea');
+      const fileInput = document.getElementById('fileInput');
+      const categorySelect = document.getElementById('categorySelect');
+      const fileCard = document.getElementById('fileCard');
+      const fileNameEl = document.getElementById('fileName');
+      const fileMetaEl = document.getElementById('fileMeta');
+      const progressWrap = document.getElementById('progressWrap');
+      const progressTrack = document.getElementById('progressTrack');
+      const progressPercent = document.getElementById('progressPercent');
+      const progressLabel = document.getElementById('progressLabel');
+      const progressDetail = document.getElementById('progressDetail');
+      const statusBox = document.getElementById('statusBox');
+      const resultUrl = document.getElementById('resultUrl');
+      const copyButton = document.getElementById('copyButton');
+      let busy = false;
+      let currentStatus = INITIAL_STATUS;
+      let statusPollTimer = null;
+      let closeScheduled = false;
+
+      function formatSize(bytes) {
+        const value = Number(bytes || 0);
+        if (value < 1024) return value + ' B';
+        const units = ['KB', 'MB', 'GB', 'TB'];
+        let size = value / 1024;
+        let index = 0;
+        while (size >= 1024 && index < units.length - 1) { size /= 1024; index++; }
+        return size.toFixed(size >= 100 ? 0 : size >= 10 ? 1 : 2) + ' ' + units[index];
+      }
+
+      function setStatus(message, type = 'info') {
+        statusBox.className = 'status ' + type;
+        statusBox.textContent = message;
+      }
+
+      function clearStatus() {
+        statusBox.className = 'status';
+        statusBox.textContent = '';
+      }
+
+      function setProgress(percent, label, detail) {
+        const safePercent = Math.max(0, Math.min(100, Number(percent || 0)));
+        progressWrap.style.display = 'block';
+        progressTrack.style.width = safePercent + '%';
+        progressPercent.textContent = safePercent.toFixed(safePercent < 100 ? 1 : 0) + '%';
+        progressLabel.textContent = label || '正在上传';
+        progressDetail.textContent = detail || '';
+      }
+
+      function showResult(url) {
+        resultUrl.value = url || '';
+        copyButton.disabled = !url;
+        if (url) {
+          uploadArea.classList.add('disabled');
+          fileInput.disabled = true;
+          categorySelect.disabled = true;
+          stopStatusPolling();
+        }
+      }
+
+      function stopStatusPolling() {
+        if (statusPollTimer) {
+          clearInterval(statusPollTimer);
+          statusPollTimer = null;
+        }
+      }
+
+      function closeCancelledPage() {
+        if (closeScheduled) return;
+        closeScheduled = true;
+        stopStatusPolling();
+        uploadArea.classList.add('disabled');
+        fileInput.disabled = true;
+        categorySelect.disabled = true;
+
+        // 先让用户看到取消原因，再尝试关闭 Telegram WebApp/内置浏览器页面。
+        setTimeout(() => {
+          try {
+            if (
+              window.Telegram &&
+              window.Telegram.WebApp &&
+              typeof window.Telegram.WebApp.close === 'function'
+            ) {
+              window.Telegram.WebApp.close();
+            }
+          } catch (_) {}
+
+          try { window.close(); } catch (_) {}
+
+          // 普通浏览器通常禁止脚本关闭非脚本打开的标签页，退化为返回上一页；
+          // 若仍无法返回，则清空当前页面，避免继续提交上传。
+          setTimeout(() => {
+            try {
+              if (history.length > 1) {
+                history.back();
+                return;
+              }
+            } catch (_) {}
+            document.body.innerHTML =
+              '<main style="font-family:sans-serif;padding:32px;text-align:center">' +
+              '<h2>上传任务已取消</h2><p>该页面已关闭，请返回 Telegram。</p></main>';
+          }, 300);
+        }, 1800);
+      }
+
+      async function fetchStatus() {
+        const response = await fetch('/large-upload/status?token=' + encodeURIComponent(TOKEN), {
+          cache: 'no-store'
+        });
+        const data = await response.json();
+        if (!response.ok || !data.status) throw new Error(data.error || '读取上传状态失败');
+        currentStatus = data.session;
+        return currentStatus;
+      }
+
+      function applyStatus(status) {
+        if (!status) return;
+        if (status.cancelled || status.status === 'cancelled' || status.closePage) {
+          const reason = status.error || '两个分片间隔超过 10 分钟，任务已取消，全部分片已删除。';
+          setProgress(0, '任务已取消', '已清理该任务的全部 Telegram 分片');
+          setStatus(reason + ' 页面即将关闭。', 'error');
+          closeCancelledPage();
+          return;
+        }
+        if (status.resultUrl) {
+          showResult(status.resultUrl);
+          setProgress(100, '上传完成', '直链已经生成，并已发送到机器人。');
+          setStatus('上传完成，可以复制直链。', 'success');
+          return;
+        }
+        if (status.fileName) {
+          fileCard.style.display = 'block';
+          fileNameEl.textContent = status.fileName;
+          fileMetaEl.textContent = formatSize(status.fileSize) + ' · 已完成 ' + status.uploadedChunks + '/' + status.totalChunks + ' 个分片';
+        }
+        if (status.status === 'uploading' || status.status === 'finalizing') {
+          setProgress(status.progress, status.status === 'finalizing' ? '正在生成直链' : '已有上传进度',
+            formatSize(status.uploadedBytes) + ' / ' + formatSize(status.fileSize));
+          const deadlineText = status.chunkDeadlineAt
+            ? '下一片须在 ' + new Date(status.chunkDeadlineAt).toLocaleTimeString() + ' 前完成。'
+            : '';
+          setStatus(
+            '页面关闭不会立即删除分片；若相邻分片超过 10 分钟，任务将自动取消并清理。' + deadlineText,
+            'info'
+          );
+        } else if (status.error) {
+          setStatus(status.error, 'error');
+        }
+      }
+
+      function uploadChunkWithProgress(formData, baseBytes, fileSize, chunkIndex, totalChunks) {
+        return new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', '/large-upload/chunk?token=' + encodeURIComponent(TOKEN));
+          xhr.responseType = 'json';
+          xhr.upload.onprogress = event => {
+            if (!event.lengthComputable) return;
+            const uploaded = Math.min(fileSize, baseBytes + event.loaded);
+            const percent = uploaded / fileSize * 100;
+            setProgress(percent, '正在上传第 ' + (chunkIndex + 1) + '/' + totalChunks + ' 片',
+              formatSize(uploaded) + ' / ' + formatSize(fileSize));
+          };
+          xhr.onload = () => {
+            const data = xhr.response || {};
+            if (xhr.status >= 200 && xhr.status < 300 && data.status) {
+              resolve(data);
+            } else {
+              if (data.cancelled || data.closePage || xhr.status === 410) {
+                applyStatus({ status: 'cancelled', cancelled: true, closePage: true, error: data.error });
+              }
+              reject(new Error(data.error || '分片上传失败（HTTP ' + xhr.status + '）'));
+            }
+          };
+          xhr.onerror = () => reject(new Error('网络连接中断'));
+          xhr.send(formData);
+        });
+      }
+
+      async function uploadFile(file) {
+        if (busy) return;
+        if (!file) return;
+        if (file.size <= 0) return setStatus('文件为空，无法上传。', 'error');
+        if (file.size > MAX_SIZE) return setStatus('文件超过最大限制：' + formatSize(MAX_SIZE), 'error');
+        busy = true;
+        clearStatus();
+        uploadArea.classList.add('disabled');
+        fileInput.disabled = true;
+        categorySelect.disabled = true;
+        fileCard.style.display = 'block';
+        fileNameEl.textContent = file.name;
+        fileMetaEl.textContent = formatSize(file.size) + ' · ' + (file.type || 'application/octet-stream');
+
+        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+        const startTime = Date.now();
+        try {
+          const latest = await fetchStatus();
+          if (latest.resultUrl) {
+            applyStatus(latest);
+            return;
+          }
+          if (latest.fileName && (latest.fileName !== file.name || Number(latest.fileSize) !== Number(file.size))) {
+            throw new Error('该页面已有另一个文件的上传进度，请重新从机器人生成页面。');
+          }
+          const completed = new Set((latest.uploadedIndexes || []).map(Number));
+          let uploadedBytes = Number(latest.uploadedBytes || 0);
+
+          for (let index = 0; index < totalChunks; index++) {
+            if (completed.has(index)) continue;
+            const start = index * CHUNK_SIZE;
+            const end = Math.min(file.size, start + CHUNK_SIZE);
+            const chunk = file.slice(start, end);
+            const formData = new FormData();
+            formData.append('token', TOKEN);
+            formData.append('chunk', chunk, file.name + '.part' + String(index + 1).padStart(5, '0'));
+            formData.append('chunk_index', String(index));
+            formData.append('total_chunks', String(totalChunks));
+            formData.append('file_name', file.name);
+            formData.append('file_size', String(file.size));
+            formData.append('mime_type', file.type || 'application/octet-stream');
+            formData.append('category', categorySelect.value || '');
+
+            const result = await uploadChunkWithProgress(
+              formData,
+              uploadedBytes,
+              file.size,
+              index,
+              totalChunks
+            );
+            uploadedBytes = Number(result.uploadedBytes || end);
+            const elapsedSeconds = Math.max(1, (Date.now() - startTime) / 1000);
+            const speed = uploadedBytes / elapsedSeconds;
+            setProgress(result.progress, '已完成 ' + result.uploadedChunks + '/' + totalChunks + ' 个分片',
+              formatSize(uploadedBytes) + ' / ' + formatSize(file.size) + ' · ' + formatSize(speed) + '/s');
+          }
+
+          setProgress(99.8, '正在校验分片并生成直链', '请勿关闭页面');
+          const completeResponse = await fetch('/large-upload/complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: TOKEN })
+          });
+          const completeData = await completeResponse.json();
+          if (!completeResponse.ok || !completeData.status) {
+            throw new Error(completeData.error || '生成直链失败');
+          }
+          showResult(completeData.url);
+          setProgress(100, '上传完成', '共 ' + completeData.chunkCount + ' 个分片');
+          setStatus('上传完成，直链已生成，同时已发送到机器人。', 'success');
+        } catch (error) {
+          setStatus(error.message || '上传失败', 'error');
+          const latest = await fetchStatus().catch(() => null);
+          if (latest) applyStatus(latest);
+        } finally {
+          busy = false;
+          if (!resultUrl.value && !closeScheduled) {
+            uploadArea.classList.remove('disabled');
+            fileInput.disabled = false;
+            categorySelect.disabled = false;
+          }
+        }
+      }
+
+      fileInput.addEventListener('change', event => uploadFile(event.target.files && event.target.files[0]));
+      ['dragenter', 'dragover'].forEach(name => uploadArea.addEventListener(name, event => {
+        event.preventDefault();
+        if (!busy) uploadArea.classList.add('dragover');
+      }));
+      ['dragleave', 'drop'].forEach(name => uploadArea.addEventListener(name, event => {
+        event.preventDefault();
+        uploadArea.classList.remove('dragover');
+      }));
+      uploadArea.addEventListener('drop', event => {
+        const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+        if (file) uploadFile(file);
+      });
+      copyButton.addEventListener('click', async () => {
+        if (!resultUrl.value) return;
+        try {
+          await navigator.clipboard.writeText(resultUrl.value);
+          copyButton.textContent = '已复制';
+          setTimeout(() => { copyButton.textContent = '复制直链'; }, 1200);
+        } catch (_) {
+          resultUrl.select();
+          document.execCommand('copy');
+        }
+      });
+
+      applyStatus(INITIAL_STATUS);
+      if (!INITIAL_STATUS.resultUrl && !INITIAL_STATUS.cancelled) {
+        statusPollTimer = setInterval(async () => {
+          try {
+            const latest = await fetchStatus();
+            applyStatus(latest);
+          } catch (_) {
+            // 临时网络错误不打断正在进行的分片请求；下轮继续检查。
+          }
+        }, 5000);
+      }
+    </script>
+  </body>
+  </html>`;
+}
+
 function generateUploadPage(categoryOptions, storageType) {
   return `<!DOCTYPE html>
   <html lang="zh-CN">
