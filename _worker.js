@@ -2491,7 +2491,6 @@ function getContentType(ext) {
     tif: 'image/tiff',
     mp4: 'video/mp4',
     webm: 'video/webm',
-    ogg: 'video/ogg',
     ogv: 'video/ogg',
     avi: 'video/x-msvideo',
     mov: 'video/quicktime',
