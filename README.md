@@ -1,6 +1,7 @@
 # 关于 Cftc 的说明
 - 使用 Cloudflare 与 Telegram 作为基础的含直链云盘
 - 支持 Web 与 Telegram Bot 进行操作
+- [详细说明](https://catial.unmia.net/post/2026072200001)
 
 # 部署教程
 - [直达链接](https://github.com/iawooo/cftc/blob/main/README.md)
