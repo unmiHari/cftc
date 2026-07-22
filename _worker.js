@@ -64,6 +64,16 @@ async function recreateAllTables(config) {
         FOREIGN KEY (current_category_id) REFERENCES categories(id)
       )
     `).run();
+    
+    await config.database.prepare(`
+      CREATE TABLE IF NOT EXISTS allowed_users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT NOT NULL UNIQUE,
+        added_by TEXT,
+        created_at INTEGER NOT NULL
+      )
+    `).run();
+    
     await config.database.prepare(`
       CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,7 +101,12 @@ async function recreateAllTables(config) {
 }
 async function validateDatabaseStructure(config) {
   try {
-    const tables = ['categories', 'user_settings', 'files'];
+    const tables = [
+      'categories',
+      'user_settings',
+      'allowed_users',
+      'files'
+    ];
     for (const table of tables) {
       try {
         await config.database.prepare(`SELECT 1 FROM ${table} LIMIT 1`).run();
@@ -120,6 +135,12 @@ async function validateDatabaseStructure(config) {
         { name: 'is_processing', type: 'INTEGER' },
         { name: 'lock_time', type: 'INTEGER' },
         { name: 'upload_seq', type: 'INTEGER' }
+      ],
+      allowed_users: [
+        { name: 'id', type: 'INTEGER' },
+        { name: 'chat_id', type: 'TEXT' },
+        { name: 'added_by', type: 'TEXT' },
+        { name: 'created_at', type: 'INTEGER' }
       ],
       files: [
         { name: 'id', type: 'INTEGER' },
@@ -379,6 +400,164 @@ async function ensureColumnExists(config, tableName, columnName, columnType) {
     return false; 
   }
 }
+// 将英文逗号分隔的 ID 转为数组
+function normalizeIdList(value) {
+  return String(value || '')
+    .split(',')
+    .map(id => id.trim())
+    .filter(Boolean);
+}
+
+// 检查是否为 TG_ADMIN_ID 管理员
+function isTelegramAdmin(chatId, config) {
+  const normalizedId = String(chatId || '').trim();
+
+  return (
+    Array.isArray(config.tgAdminId) &&
+    config.tgAdminId.includes(normalizedId)
+  );
+}
+
+// 验证 Telegram 私聊用户 ID
+function normalizeTelegramUserId(value) {
+  const normalizedId = String(value || '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .trim();
+
+  // 当前代码忽略群组消息，所以这里只接受正整数用户 ID
+  if (!/^\d{5,20}$/.test(normalizedId)) {
+    return null;
+  }
+
+  return normalizedId;
+}
+
+// 判断用户是否有权使用机器人
+async function isAllowedTelegramUser(chatId, config) {
+  const normalizedId = String(chatId || '').trim();
+
+  // 管理员永远直接放行
+  if (isTelegramAdmin(normalizedId, config)) {
+    return true;
+  }
+
+  const user = await config.database.prepare(`
+    SELECT chat_id
+    FROM allowed_users
+    WHERE chat_id = ?
+    LIMIT 1
+  `).bind(normalizedId).first();
+
+  return !!user;
+}
+
+// 获取所有普通授权用户
+async function listAllowedTelegramUsers(config) {
+  const result = await config.database.prepare(`
+    SELECT
+      id,
+      chat_id,
+      added_by,
+      created_at
+    FROM allowed_users
+    ORDER BY created_at DESC, id DESC
+  `).all();
+
+  const users = result.results || [];
+
+  // 防止管理员同时出现在普通用户列表中
+  return users.filter(user => {
+    return !isTelegramAdmin(user.chat_id, config);
+  });
+}
+
+// 添加普通授权用户
+async function addAllowedTelegramUser(chatId, addedBy, config) {
+  const normalizedId = normalizeTelegramUserId(chatId);
+
+  if (!normalizedId) {
+    throw new Error('用户 ID 格式不正确');
+  }
+
+  // 管理员本身不需要写入 allowed_users
+  if (isTelegramAdmin(normalizedId, config)) {
+    return {
+      chatId: normalizedId,
+      created: false,
+      alreadyAdmin: true
+    };
+  }
+
+  const existing = await config.database.prepare(`
+    SELECT id
+    FROM allowed_users
+    WHERE chat_id = ?
+    LIMIT 1
+  `).bind(normalizedId).first();
+
+  if (existing) {
+    return {
+      chatId: normalizedId,
+      created: false,
+      alreadyAdmin: false
+    };
+  }
+
+  await config.database.prepare(`
+    INSERT INTO allowed_users (
+      chat_id,
+      added_by,
+      created_at
+    )
+    VALUES (?, ?, ?)
+  `).bind(
+    normalizedId,
+    String(addedBy || ''),
+    Date.now()
+  ).run();
+
+  return {
+    chatId: normalizedId,
+    created: true,
+    alreadyAdmin: false
+  };
+}
+
+// 删除普通用户授权
+async function removeAllowedTelegramUser(chatId, config) {
+  const normalizedId = normalizeTelegramUserId(chatId);
+
+  if (!normalizedId) {
+    throw new Error('用户 ID 格式不正确');
+  }
+
+  // 禁止删除 TG_ADMIN_ID
+  if (isTelegramAdmin(normalizedId, config)) {
+    throw new Error('TG_ADMIN_ID 管理员不能被删除');
+  }
+
+  const result = await config.database.prepare(`
+    DELETE FROM allowed_users
+    WHERE chat_id = ?
+  `).bind(normalizedId).run();
+
+  return !!(
+    result.meta &&
+    Number(result.meta.changes || 0) > 0
+  );
+}
+
+// 网页上传归属于 TG_ADMIN_ID 中第一个管理员
+function getWebOwnerChatId(config) {
+  if (
+    Array.isArray(config.tgAdminId) &&
+    config.tgAdminId.length > 0
+  ) {
+    return config.tgAdminId[0];
+  }
+
+  return '';
+}
 async function setWebhook(webhookUrl, botToken) {
   if (!botToken) {
     console.log('未配置Telegram机器人令牌，跳过webhook设置');
@@ -438,9 +617,8 @@ export default {
       password: env.PASSWORD || '',
       enableAuth: env.ENABLE_AUTH === 'true' || false,
       tgBotToken: env.TG_BOT_TOKEN || '',
-      tgChatId: env.TG_CHAT_ID ? env.TG_CHAT_ID.split(",") : [], 
-      tgAdminId: env.TG_ADMIN_ID ? env.TG_ADMIN_ID.split(",") : [],
-      tgStorageChatId: env.TG_STORAGE_CHAT_ID || env.TG_CHAT_ID || '',
+      tgAdminId: normalizeIdList(env.TG_ADMIN_ID),
+      tgStorageChatId: String(env.TG_STORAGE_CHAT_ID || '').trim(),
       cookie: Number(env.COOKIE) || 7,
       maxSizeMB: Number(env.MAX_SIZE_MB) || 20,
       bucket: env.BUCKET,
@@ -470,7 +648,24 @@ export default {
     const isLoginPage = pathname === '/login';
     const isPublicApi = pathname === '/webhook' || pathname === '/config' || pathname === '/bing';
     console.log(`[Auth] isAuthEnabled: ${isAuthEnabled}, isAuthenticated: ${isAuthenticated}, isLoginPage: ${isLoginPage}, isPublicApi: ${isPublicApi}`);
-    const protectedPaths = ['/', '/upload', '/admin', '/create-category', '/delete-category', '/update-suffix', '/delete', '/delete-multiple', '/search'];
+    const protectedPaths = [
+      '/',
+      '/upload',
+      '/admin',
+    
+      // 用户管理页面和接口
+      '/users',
+      '/api/users',
+      '/api/users/add',
+      '/api/users/delete',
+    
+      '/create-category',
+      '/delete-category',
+      '/update-suffix',
+      '/delete',
+      '/delete-multiple',
+      '/search'
+    ];
     const requiresAuth = isAuthEnabled && protectedPaths.includes(pathname);
     console.log(`[Auth] Path requires authentication: ${requiresAuth}`);
     if (requiresAuth && !isAuthenticated && !isLoginPage) {
@@ -494,11 +689,20 @@ export default {
     }
     console.log(`[Auth] Check PASSED for path: ${pathname}`);
     try {
-      if (!isPublicApi && !isLoginPage) { 
-          await initDatabase(config);
-          console.log('[DB] Database initialized successfully.');
+      const shouldInitDatabase =
+        !isLoginPage &&
+        (
+          pathname === '/webhook' ||
+          !isPublicApi
+        );
+    
+      if (shouldInitDatabase) {
+        await initDatabase(config);
+        console.log('[DB] Database initialized successfully.');
       } else {
-          console.log('[DB] Skipping database initialization for public API or login page.');
+        console.log(
+          '[DB] Skipping database initialization for public API or login page.'
+        );
       }
     } catch (error) {
       console.error(`[DB] Database initialization FAILED: ${error.message}`);
@@ -540,6 +744,25 @@ export default {
       '/admin': async () => {
           console.log('[Route] Handling /admin request.');
           return handleAdminRequest(request, config);
+      },
+      '/users': async () => {
+        console.log('[Route] Handling /users request.');
+        return handleUserManagementRequest(request, config);
+      },
+      
+      '/api/users': async () => {
+        console.log('[Route] Handling /api/users request.');
+        return handleListAllowedUsersRequest(request, config);
+      },
+      
+      '/api/users/add': async () => {
+        console.log('[Route] Handling /api/users/add request.');
+        return handleAddAllowedUserRequest(request, config);
+      },
+      
+      '/api/users/delete': async () => {
+        console.log('[Route] Handling /api/users/delete request.');
+        return handleDeleteAllowedUserRequest(request, config);
       },
       '/delete': () => handleDeleteRequest(request, config),
       '/delete-multiple': () => handleDeleteMultipleRequest(request, config),
@@ -609,17 +832,46 @@ async function handleTelegramWebhook(request, config) {
       console.log('[Webhook] Received update without message or callback_query:', JSON.stringify(update));
       return new Response('OK');
     }
-    // Check if the chatId is included in the allowed list
-    if (config.tgChatId && config.tgChatId.length > 0 && !config.tgChatId.includes(chatId)) {
-      console.log(`[Auth Check] FAILED: Chat ID ${chatId} (User ID: ${userId}) is not in the allowed list [${config.tgChatId.join(', ')}]. Ignoring update.`);
+    const isAdmin = isTelegramAdmin(chatId, config);
+    
+    let isAllowed = false;
+    
+    try {
+      isAllowed =
+        isAdmin ||
+        await isAllowedTelegramUser(chatId, config);
+    } catch (error) {
+      console.error(
+        `[Auth Check] 查询用户授权失败: ${error.message}`
+      );
+    
+      return new Response(
+        'Authorization database error',
+        { status: 500 }
+      );
+    }
+    
+    if (!isAllowed) {
+      console.log(
+        `[Auth Check] FAILED: Chat ID ${chatId}, ` +
+        `User ID ${userId} is not authorized.`
+      );
+    
       if (config.tgBotToken) {
-         await sendMessage(chatId, "你无权使用 请联系管理员授权", config.tgBotToken);
-      } else {
-         console.warn("[Auth Check] Cannot send unauthorized message: TG_BOT_TOKEN not configured.")
+        await sendMessage(
+          chatId,
+          "❌ 你无权使用，请联系管理员添加你的 Telegram 用户 ID",
+          config.tgBotToken
+        );
       }
+    
       return new Response('OK');
     }
-    console.log(`[Auth Check] PASSED: Chat ID ${chatId} (User ID: ${userId}) is allowed.`);
+    
+    console.log(
+      `[Auth Check] PASSED: Chat ID ${chatId}, ` +
+      `User ID ${userId}, admin=${isAdmin}.`
+    );
     let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
     if (!userSetting) {
       let defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
@@ -647,7 +899,97 @@ async function handleTelegramWebhook(request, config) {
       };
     }
     if (update.message) {
-      if (userSetting.waiting_for === 'new_category' && update.message.text) {
+      // 管理员正在输入要添加的用户 ID
+      if (
+        userSetting.waiting_for === 'add_user_id' &&
+        update.message.text
+      ) {
+        if (!isTelegramAdmin(chatId, config)) {
+          await config.database.prepare(`
+            UPDATE user_settings
+            SET waiting_for = NULL
+            WHERE chat_id = ?
+          `).bind(chatId).run();
+    
+          userSetting.waiting_for = null;
+    
+          await sendMessage(
+            chatId,
+            "❌ 只有 TG_ADMIN_ID 管理员可以添加用户",
+            config.tgBotToken
+          );
+    
+          return new Response('OK');
+        }
+    
+        const targetUserId = normalizeTelegramUserId(
+          update.message.text
+        );
+    
+        if (!targetUserId) {
+          await sendMessage(
+            chatId,
+            "⚠️ 用户 ID 格式不正确。\n\n" +
+            "请输入纯数字 Telegram 用户 ID，例如：123456789",
+            config.tgBotToken
+          );
+    
+          // 不清除等待状态，管理员可以重新输入
+          return new Response('OK');
+        }
+    
+        try {
+          const result = await addAllowedTelegramUser(
+            targetUserId,
+            chatId,
+            config
+          );
+    
+          await config.database.prepare(`
+            UPDATE user_settings
+            SET waiting_for = NULL
+            WHERE chat_id = ?
+          `).bind(chatId).run();
+    
+          userSetting.waiting_for = null;
+    
+          if (result.alreadyAdmin) {
+            await sendMessage(
+              chatId,
+              `ℹ️ 用户 ${targetUserId} 已经是 TG_ADMIN_ID 管理员，无需重复添加`,
+              config.tgBotToken
+            );
+          } else if (!result.created) {
+            await sendMessage(
+              chatId,
+              `ℹ️ 用户 ${targetUserId} 已经在授权列表中`,
+              config.tgBotToken
+            );
+          } else {
+            await sendMessage(
+              chatId,
+              `✅ 已添加授权用户：${targetUserId}`,
+              config.tgBotToken
+            );
+          }
+        } catch (error) {
+          console.error('添加授权用户失败:', error);
+    
+          await sendMessage(
+            chatId,
+            `❌ 添加用户失败：${error.message}`,
+            config.tgBotToken
+          );
+        }
+    
+        await sendPanel(chatId, userSetting, config);
+        return new Response('OK');
+      }
+    
+      else if (
+        userSetting.waiting_for === 'new_category' &&
+        update.message.text
+      ) {
         const categoryName = update.message.text.trim();
         try {
           const existingCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
@@ -999,7 +1341,14 @@ async function handleTelegramWebhook(request, config) {
 }
 async function sendPanel(chatId, userSetting, config) {
   try {
-    const cacheKey = `menu:${chatId}:${userSetting.storage_type || 'default'}`;
+    const menuRole = isTelegramAdmin(chatId, config)
+      ? 'admin'
+      : 'user';
+    
+    const cacheKey =
+      `menu:${chatId}:` +
+      `${userSetting.storage_type || 'default'}:` +
+      `${menuRole}`;
     if (config.menuCache && config.menuCache.has(cacheKey)) {
       const cachedData = config.menuCache.get(cacheKey);
       if (Date.now() - cachedData.timestamp < config.menuCacheTTL) {
@@ -1091,30 +1440,75 @@ async function generateMainMenu(chatId, userSetting, config) {
   💾 已用空间：${formatSize(stats && stats.total_size ? stats.total_size : 0)}
   ${notificationText || defaultNotification}
   👇 请选择操作：`;
-  const keyboard = getKeyboardLayout(userSetting);
+  const keyboard = getKeyboardLayout(
+    userSetting,
+    isTelegramAdmin(chatId, config)
+  );
   return { messageBody, keyboard };
 }
-function getKeyboardLayout(userSetting) {
-  const storageType = userSetting.storage_type || 'telegram';
-  return {
-    inline_keyboard: [
-      [
-        { text: "📤 切换存储", callback_data: "switch_storage" },
-        { text: "📊 R2统计", callback_data: "r2_stats" }
-      ],
-      [
-        { text: "📝 创建分类", callback_data: "create_category" },
-        { text: "📋 选择分类", callback_data: "list_categories" }
-      ],
-      [
-        { text: "📂 最近文件", callback_data: "recent_files" },
-        { text: "✏️ 修改后缀", callback_data: "edit_suffix_input" },
-        { text: "🗑️ 删除文件", callback_data: "delete_file_input" }
-      ],
-      [
-        { text: "📦 联系我们", url: "https://t.me/unmihari1" }
-      ]
+function getKeyboardLayout(userSetting, isAdmin = false) {
+  const rows = [
+    [
+      {
+        text: "📋 选择分类",
+        callback_data: "list_categories"
+      }
     ]
+  ];
+
+  // 仅管理员显示用户管理按钮
+  if (isAdmin) {
+    rows.push([
+      {
+        text: "📤 切换存储",
+        callback_data: "switch_storage"
+      },
+      {
+        text: "📊 R2统计",
+        callback_data: "r2_stats"
+      },
+      {
+        text: "📝 创建分类",
+        callback_data: "create_category"
+      },
+    ],
+    [
+      {
+        text: "➕ 添加用户",
+        callback_data: "add_user"
+      },
+      {
+        text: "➖ 删除用户",
+        callback_data: "delete_user"
+      }
+    ]);
+  }
+
+  rows.push(
+    [
+      {
+        text: "📂 最近文件",
+        callback_data: "recent_files"
+      },
+      {
+        text: "✏️ 修改后缀",
+        callback_data: "edit_suffix_input"
+      },
+      {
+        text: "🗑️ 删除文件",
+        callback_data: "delete_file_input"
+      }
+    ],
+    [
+      {
+        text: "📦 联系我们",
+        url: "https://t.me/unmihari1"
+      }
+    ]
+  );
+
+  return {
+    inline_keyboard: rows
   };
 }
 // 生成简洁的存储 key，避免用杂乱原始文件名拼URL
@@ -1194,20 +1588,59 @@ async function handleCallbackQuery(update, config, userSetting) {
     console.error('确认回调查询失败:', error);
   });
   try {
-    if (userSetting.waiting_for && !cbData.startsWith('delete_file_do_')) {
-       if (!(userSetting.waiting_for === 'new_suffix' && cbData.startsWith('edit_suffix_file_')) &&
-           !(userSetting.waiting_for === 'new_category' && cbData === 'create_category') &&
-           !(userSetting.waiting_for === 'delete_file_input' && cbData === 'delete_file_input') &&
-           !(userSetting.waiting_for === 'edit_suffix_input_file' && cbData === 'edit_suffix_input') &&
-           !(userSetting.waiting_for === 'edit_suffix_input_new' && userSetting.editing_file_id)) {
-           await config.database.prepare('UPDATE user_settings SET waiting_for = NULL, editing_file_id = NULL WHERE chat_id = ?')
-             .bind(chatId).run();
-           userSetting.waiting_for = null;
-           userSetting.editing_file_id = null;
-       }
+    if (
+      userSetting.waiting_for &&
+      !cbData.startsWith('delete_file_do_')
+    ) {
+      if (
+        !(
+          userSetting.waiting_for === 'new_suffix' &&
+          cbData.startsWith('edit_suffix_file_')
+        ) &&
+        !(
+          userSetting.waiting_for === 'new_category' &&
+          cbData === 'create_category'
+        ) &&
+        !(
+          userSetting.waiting_for === 'add_user_id' &&
+          cbData === 'add_user'
+        ) &&
+        !(
+          userSetting.waiting_for === 'delete_file_input' &&
+          cbData === 'delete_file_input'
+        ) &&
+        !(
+          userSetting.waiting_for === 'edit_suffix_input_file' &&
+          cbData === 'edit_suffix_input'
+        ) &&
+        !(
+          userSetting.waiting_for === 'edit_suffix_input_new' &&
+          userSetting.editing_file_id
+        )
+      ) {
+        await config.database.prepare(`
+          UPDATE user_settings
+          SET waiting_for = NULL,
+              editing_file_id = NULL
+          WHERE chat_id = ?
+        `).bind(chatId).run();
+    
+        userSetting.waiting_for = null;
+        userSetting.editing_file_id = null;
+      }
     }
     const cacheKey = `button:${chatId}:${cbData}`;
-    if (config.buttonCache && config.buttonCache.has(cacheKey) && !cbData.startsWith('delete_file_confirm_') && !cbData.startsWith('delete_file_do_') ) {
+    const isUserManagementCallback =
+      cbData === 'add_user' ||
+      cbData === 'delete_user' ||
+      cbData.startsWith('remove_user_');
+    if (
+      config.buttonCache &&
+      config.buttonCache.has(cacheKey) &&
+      !isUserManagementCallback &&
+      !cbData.startsWith('delete_file_confirm_') &&
+      !cbData.startsWith('delete_file_do_')
+    ) {
       const cachedData = config.buttonCache.get(cacheKey);
       if (Date.now() - cachedData.timestamp < config.buttonCacheTTL) {
         console.log(`使用缓存的按钮响应: ${cacheKey}`);
@@ -1287,6 +1720,165 @@ async function handleCallbackQuery(update, config, userSetting) {
         { ...userSetting, storage_type: newStorageType },
         config
       );
+    }
+    else if (cbData === 'add_user') {
+      if (!isTelegramAdmin(chatId, config)) {
+        await answerPromise;
+    
+        await sendMessage(
+          chatId,
+          "❌ 只有 TG_ADMIN_ID 管理员可以添加用户",
+          config.tgBotToken
+        );
+    
+        return;
+      }
+    
+      await Promise.all([
+        answerPromise,
+    
+        config.database.prepare(`
+          UPDATE user_settings
+          SET waiting_for = ?,
+              editing_file_id = NULL
+          WHERE chat_id = ?
+        `).bind(
+          'add_user_id',
+          chatId
+        ).run()
+      ]);
+    
+      userSetting.waiting_for = 'add_user_id';
+      userSetting.editing_file_id = null;
+    
+      await sendMessage(
+        chatId,
+        "➕ 请回复此消息，输入需要授权的 Telegram 用户 ID。\n\n" +
+        "只输入纯数字，例如：123456789",
+        config.tgBotToken
+      );
+    }
+    else if (cbData === 'delete_user') {
+      if (!isTelegramAdmin(chatId, config)) {
+        await answerPromise;
+    
+        await sendMessage(
+          chatId,
+          "❌ 只有 TG_ADMIN_ID 管理员可以删除用户",
+          config.tgBotToken
+        );
+    
+        return;
+      }
+    
+      const users = await listAllowedTelegramUsers(config);
+    
+      await answerPromise;
+    
+      if (!users.length) {
+        await sendMessage(
+          chatId,
+          "ℹ️ 当前没有普通授权用户",
+          config.tgBotToken
+        );
+    
+        return;
+      }
+    
+      const userButtons = users.map(user => {
+        return [
+          {
+            text: `🗑️ ${user.chat_id}`,
+            callback_data: `remove_user_${user.chat_id}`
+          }
+        ];
+      });
+    
+      userButtons.push([
+        {
+          text: "« 返回",
+          callback_data: "back_to_panel"
+        }
+      ]);
+    
+      await fetch(
+        `https://api.telegram.org/bot${config.tgBotToken}/sendMessage`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text:
+              "➖ 请选择要取消授权的用户：\n\n" +
+              "删除授权不会删除该用户已经上传的文件。",
+            reply_markup: {
+              inline_keyboard: userButtons
+            }
+          })
+        }
+      );
+    }
+    else if (cbData.startsWith('remove_user_')) {
+      if (!isTelegramAdmin(chatId, config)) {
+        await answerPromise;
+    
+        await sendMessage(
+          chatId,
+          "❌ 只有 TG_ADMIN_ID 管理员可以删除用户",
+          config.tgBotToken
+        );
+    
+        return;
+      }
+    
+      const targetUserId = normalizeTelegramUserId(
+        cbData.slice('remove_user_'.length)
+      );
+    
+      await answerPromise;
+    
+      if (!targetUserId) {
+        await sendMessage(
+          chatId,
+          "❌ 无效的 Telegram 用户 ID",
+          config.tgBotToken
+        );
+    
+        return;
+      }
+    
+      try {
+        const removed = await removeAllowedTelegramUser(
+          targetUserId,
+          config
+        );
+    
+        if (removed) {
+          await sendMessage(
+            chatId,
+            `✅ 已取消用户 ${targetUserId} 的使用权限`,
+            config.tgBotToken
+          );
+        } else {
+          await sendMessage(
+            chatId,
+            `ℹ️ 用户 ${targetUserId} 已不在授权列表中`,
+            config.tgBotToken
+          );
+        }
+      } catch (error) {
+        console.error('删除授权用户失败:', error);
+    
+        await sendMessage(
+          chatId,
+          `❌ 删除用户失败：${error.message}`,
+          config.tgBotToken
+        );
+      }
+    
+      await sendPanel(chatId, userSetting, config);
     }
     else if (cbData === 'list_categories') {
       const categoriesPromise = config.database.prepare('SELECT id, name FROM categories').all();
@@ -1668,6 +2260,12 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       }
       console.log('Telegram上传方法:', { method, field });
       const arrayBuffer = await fileResponse.arrayBuffer();
+
+      if (!config.tgStorageChatId) {
+        throw new Error(
+          '未配置 TG_STORAGE_CHAT_ID，无法使用 Telegram 存储'
+        );
+      }
       const tgFormData = new FormData();
       tgFormData.append('chat_id', config.tgStorageChatId);
       const blob = new Blob([arrayBuffer], { type: mimeType });
@@ -1988,15 +2586,35 @@ async function handleDeleteCategoryRequest(request, config) {
   }
 }
 async function handleUploadRequest(request, config) {
-  if (config.enableAuth && !authenticate(request, config)) {
-    return Response.redirect(`${new URL(request.url).origin}/`, 302);
+  if (
+    config.enableAuth &&
+    !authenticate(request, config)
+  ) {
+    return Response.redirect(
+      `${new URL(request.url).origin}/`,
+      302
+    );
+  }
+
+  const chatId = getWebOwnerChatId(config);
+
+  if (!chatId) {
+    return new Response(
+      '未配置 TG_ADMIN_ID，网页上传无法确定文件归属用户',
+      {
+        status: 500,
+        headers: {
+          'Content-Type': 'text/plain;charset=UTF-8',
+          'Cache-Control': 'no-store'
+        }
+      }
+    );
   }
   if (request.method === 'GET') {
     const categories = await config.database.prepare('SELECT id, name FROM categories').all();
     const categoryOptions = categories.results.length
       ? categories.results.map(c => `<option value="${c.id}">${c.name}</option>`).join('')
       : '<option value="">暂无分类</option>';
-    const chatId = config.tgChatId[0];
     let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
     if (!userSetting) {
       const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
@@ -2016,7 +2634,6 @@ async function handleUploadRequest(request, config) {
     const storageType = formData.get('storage_type');
     if (!file) throw new Error('未找到文件');
     if (file.size > config.maxSizeMB * 1024 * 1024) throw new Error(`文件超过${config.maxSizeMB}MB限制`);
-    const chatId = config.tgChatId[0];
     let defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
     if (!defaultCategory) {
       try {
@@ -2064,8 +2681,17 @@ async function handleUploadRequest(request, config) {
       dbFileId = key;
       dbMessageId = -1;
     } else {
+      if (!config.tgStorageChatId) {
+        throw new Error(
+          '未配置 TG_STORAGE_CHAT_ID，无法使用 Telegram 存储'
+        );
+      }
+    
       const tgFormData = new FormData();
-      tgFormData.append('chat_id', config.tgStorageChatId);
+      tgFormData.append(
+        'chat_id',
+        config.tgStorageChatId
+      );
       tgFormData.append(field, file, file.name);
       const tgResponse = await fetch(
         `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
@@ -2207,6 +2833,194 @@ async function handleDeleteMultipleRequest(request, config) {
         error: error.message 
       }),
       { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+}
+function createApiJsonResponse(data, status = 200) {
+  return new Response(
+    JSON.stringify(data),
+    {
+      status,
+      headers: {
+        'Content-Type': 'application/json;charset=UTF-8',
+        'Cache-Control': 'no-store'
+      }
+    }
+  );
+}
+
+// 用户管理页面
+async function handleUserManagementRequest(request, config) {
+  if (request.method !== 'GET') {
+    return new Response(
+      'Method Not Allowed',
+      {
+        status: 405,
+        headers: {
+          'Cache-Control': 'no-store'
+        }
+      }
+    );
+  }
+
+  return new Response(
+    generateUserManagementPage(),
+    {
+      headers: {
+        'Content-Type': 'text/html;charset=UTF-8',
+        'Cache-Control': 'no-store'
+      }
+    }
+  );
+}
+
+// 获取管理员和普通授权用户
+async function handleListAllowedUsersRequest(request, config) {
+  if (request.method !== 'GET') {
+    return createApiJsonResponse(
+      {
+        status: 0,
+        error: 'Method Not Allowed'
+      },
+      405
+    );
+  }
+
+  try {
+    const users = await listAllowedTelegramUsers(config);
+
+    return createApiJsonResponse({
+      status: 1,
+      admins: config.tgAdminId || [],
+      users
+    });
+  } catch (error) {
+    console.error('获取授权用户列表失败:', error);
+
+    return createApiJsonResponse(
+      {
+        status: 0,
+        error: error.message
+      },
+      500
+    );
+  }
+}
+
+// 网页添加授权用户
+async function handleAddAllowedUserRequest(request, config) {
+  if (request.method !== 'POST') {
+    return createApiJsonResponse(
+      {
+        status: 0,
+        error: 'Method Not Allowed'
+      },
+      405
+    );
+  }
+
+  try {
+    const body = await request.json();
+    const chatId = normalizeTelegramUserId(
+      body && body.chat_id
+    );
+
+    if (!chatId) {
+      return createApiJsonResponse(
+        {
+          status: 0,
+          error: '请输入正确的纯数字 Telegram 用户 ID'
+        },
+        400
+      );
+    }
+
+    const result = await addAllowedTelegramUser(
+      chatId,
+      `web:${config.username || 'admin'}`,
+      config
+    );
+
+    let message = '';
+
+    if (result.alreadyAdmin) {
+      message = '该用户已经是 TG_ADMIN_ID 管理员';
+    } else if (result.created) {
+      message = '用户添加成功';
+    } else {
+      message = '该用户已经在授权列表中';
+    }
+
+    return createApiJsonResponse({
+      status: 1,
+      created: result.created,
+      already_admin: result.alreadyAdmin,
+      chat_id: chatId,
+      message
+    });
+  } catch (error) {
+    console.error('网页添加授权用户失败:', error);
+
+    return createApiJsonResponse(
+      {
+        status: 0,
+        error: error.message
+      },
+      500
+    );
+  }
+}
+
+// 网页删除授权用户
+async function handleDeleteAllowedUserRequest(request, config) {
+  if (request.method !== 'POST') {
+    return createApiJsonResponse(
+      {
+        status: 0,
+        error: 'Method Not Allowed'
+      },
+      405
+    );
+  }
+
+  try {
+    const body = await request.json();
+    const chatId = normalizeTelegramUserId(
+      body && body.chat_id
+    );
+
+    if (!chatId) {
+      return createApiJsonResponse(
+        {
+          status: 0,
+          error: '用户 ID 格式不正确'
+        },
+        400
+      );
+    }
+
+    const removed = await removeAllowedTelegramUser(
+      chatId,
+      config
+    );
+
+    return createApiJsonResponse({
+      status: 1,
+      removed,
+      chat_id: chatId,
+      message: removed
+        ? '用户权限已删除'
+        : '该用户已不在授权列表中'
+    });
+  } catch (error) {
+    console.error('网页删除授权用户失败:', error);
+
+    return createApiJsonResponse(
+      {
+        status: 0,
+        error: error.message
+      },
+      400
     );
   }
 }
@@ -3506,6 +4320,585 @@ function generateUploadPage(categoryOptions, storageType) {
   </body>
   </html>`;
 }
+function generateUserManagementPage() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  >
+  <title>用户管理</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 20px;
+      min-height: 100vh;
+      font-family: Arial, "Microsoft YaHei", sans-serif;
+      background: linear-gradient(135deg, #f0f4f8, #d9e2ec);
+      color: #2c3e50;
+    }
+
+    .container {
+      max-width: 1000px;
+      margin: 0 auto;
+    }
+
+    .header,
+    .panel {
+      background: rgba(255, 255, 255, 0.96);
+      border-radius: 14px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+      padding: 22px;
+      margin-bottom: 20px;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 15px;
+    }
+
+    h1,
+    h2 {
+      margin-top: 0;
+    }
+
+    h1 {
+      margin-bottom: 0;
+      font-size: 28px;
+    }
+
+    h2 {
+      font-size: 20px;
+      margin-bottom: 16px;
+    }
+
+    .back-button {
+      display: inline-block;
+      padding: 10px 16px;
+      border-radius: 8px;
+      text-decoration: none;
+      color: white;
+      background: #3498db;
+    }
+
+    .add-form {
+      display: flex;
+      gap: 12px;
+    }
+
+    .add-form input {
+      flex: 1;
+      min-width: 0;
+      padding: 12px;
+      border: 2px solid #dfe6e9;
+      border-radius: 8px;
+      font-size: 16px;
+    }
+
+    .add-form input:focus {
+      outline: none;
+      border-color: #3498db;
+    }
+
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 11px 18px;
+      cursor: pointer;
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .add-button {
+      color: white;
+      background: #27ae60;
+    }
+
+    .delete-button {
+      color: white;
+      background: #e74c3c;
+    }
+
+    .refresh-button {
+      color: white;
+      background: #7f8c8d;
+    }
+
+    .message {
+      display: none;
+      margin-top: 14px;
+      padding: 12px;
+      border-radius: 8px;
+    }
+
+    .message.success {
+      display: block;
+      background: #eafaf1;
+      color: #1e8449;
+    }
+
+    .message.error {
+      display: block;
+      background: #fdecea;
+      color: #c0392b;
+    }
+
+    .admin-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .admin-item {
+      padding: 10px 14px;
+      border-radius: 8px;
+      background: #f3e5f5;
+      color: #7d3c98;
+      font-weight: 600;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 15px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      padding: 12px;
+      border-bottom: 1px solid #ecf0f1;
+      text-align: left;
+      word-break: break-all;
+    }
+
+    th {
+      background: #f8f9fa;
+    }
+
+    .empty {
+      padding: 20px;
+      text-align: center;
+      color: #7f8c8d;
+    }
+
+    .hint {
+      color: #7f8c8d;
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    @media (max-width: 700px) {
+      body {
+        padding: 10px;
+      }
+
+      .header {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .back-button {
+        text-align: center;
+      }
+
+      .add-form {
+        flex-direction: column;
+      }
+
+      .toolbar {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .refresh-button {
+        width: 100%;
+      }
+
+      table,
+      thead,
+      tbody,
+      tr,
+      th,
+      td {
+        display: block;
+      }
+
+      thead {
+        display: none;
+      }
+
+      tr {
+        padding: 12px;
+        margin-bottom: 12px;
+        border: 1px solid #ecf0f1;
+        border-radius: 8px;
+      }
+
+      td {
+        border-bottom: 0;
+        padding: 7px 0;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>用户管理</h1>
+      <a href="/admin" class="back-button">
+        返回文件管理
+      </a>
+    </div>
+
+    <div class="panel">
+      <h2>添加用户</h2>
+
+      <div class="add-form">
+        <input
+          type="text"
+          id="chatIdInput"
+          inputmode="numeric"
+          placeholder="输入 Telegram 用户 ID，例如 123456789"
+        >
+
+        <button
+          type="button"
+          class="add-button"
+          id="addUserButton"
+        >
+          添加用户
+        </button>
+      </div>
+
+      <div id="messageBox" class="message"></div>
+
+      <p class="hint">
+        只填写 Telegram 用户 ID，不要填写用户名或 @username。
+        TG_ADMIN_ID 管理员无需重复添加。
+      </p>
+    </div>
+
+    <div class="panel">
+      <h2>TG_ADMIN_ID 管理员</h2>
+      <div id="adminList" class="admin-list"></div>
+    </div>
+
+    <div class="panel">
+      <div class="toolbar">
+        <h2 style="margin:0;">
+          普通授权用户
+        </h2>
+
+        <button
+          type="button"
+          class="refresh-button"
+          id="refreshButton"
+        >
+          刷新列表
+        </button>
+      </div>
+
+      <div id="userTableContainer">
+        <div class="empty">正在加载……</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const chatIdInput =
+      document.getElementById('chatIdInput');
+
+    const addUserButton =
+      document.getElementById('addUserButton');
+
+    const refreshButton =
+      document.getElementById('refreshButton');
+
+    const messageBox =
+      document.getElementById('messageBox');
+
+    const adminList =
+      document.getElementById('adminList');
+
+    const userTableContainer =
+      document.getElementById('userTableContainer');
+
+    function showMessage(text, type) {
+      messageBox.textContent = text;
+      messageBox.className =
+        'message ' + (type || 'success');
+    }
+
+    function formatTime(timestamp) {
+      const value = Number(timestamp || 0);
+
+      if (!value) {
+        return '-';
+      }
+
+      return new Date(value).toLocaleString('zh-CN');
+    }
+
+    async function parseResponse(response) {
+      let data = null;
+
+      try {
+        data = await response.json();
+      } catch (error) {
+        throw new Error('服务器返回格式错误');
+      }
+
+      if (!response.ok || !data || data.status !== 1) {
+        throw new Error(
+          data && (data.error || data.message)
+            ? (data.error || data.message)
+            : '请求失败'
+        );
+      }
+
+      return data;
+    }
+
+    function renderAdmins(admins) {
+      adminList.innerHTML = '';
+
+      if (!admins || admins.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = '尚未配置 TG_ADMIN_ID';
+        adminList.appendChild(empty);
+        return;
+      }
+
+      admins.forEach(function(adminId) {
+        const item = document.createElement('div');
+        item.className = 'admin-item';
+        item.textContent = adminId;
+        adminList.appendChild(item);
+      });
+    }
+
+    function renderUsers(users) {
+      userTableContainer.innerHTML = '';
+
+      if (!users || users.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = '当前没有普通授权用户';
+        userTableContainer.appendChild(empty);
+        return;
+      }
+
+      const table = document.createElement('table');
+      const thead = document.createElement('thead');
+      const headRow = document.createElement('tr');
+
+      [
+        'Telegram 用户 ID',
+        '添加来源',
+        '添加时间',
+        '操作'
+      ].forEach(function(title) {
+        const th = document.createElement('th');
+        th.textContent = title;
+        headRow.appendChild(th);
+      });
+
+      thead.appendChild(headRow);
+      table.appendChild(thead);
+
+      const tbody = document.createElement('tbody');
+
+      users.forEach(function(user) {
+        const row = document.createElement('tr');
+
+        const idCell = document.createElement('td');
+        idCell.textContent = user.chat_id || '-';
+
+        const sourceCell = document.createElement('td');
+        sourceCell.textContent = user.added_by || '-';
+
+        const timeCell = document.createElement('td');
+        timeCell.textContent = formatTime(user.created_at);
+
+        const actionCell = document.createElement('td');
+        const deleteButton = document.createElement('button');
+
+        deleteButton.type = 'button';
+        deleteButton.className = 'delete-button';
+        deleteButton.textContent = '删除';
+
+        deleteButton.addEventListener('click', function() {
+          deleteUser(user.chat_id);
+        });
+
+        actionCell.appendChild(deleteButton);
+
+        row.appendChild(idCell);
+        row.appendChild(sourceCell);
+        row.appendChild(timeCell);
+        row.appendChild(actionCell);
+
+        tbody.appendChild(row);
+      });
+
+      table.appendChild(tbody);
+      userTableContainer.appendChild(table);
+    }
+
+    async function loadUsers() {
+      userTableContainer.innerHTML =
+        '<div class="empty">正在加载……</div>';
+
+      try {
+        const response = await fetch('/api/users', {
+          method: 'GET',
+          headers: {
+            'Accept': 'application/json'
+          },
+          cache: 'no-store'
+        });
+
+        const data = await parseResponse(response);
+
+        renderAdmins(data.admins || []);
+        renderUsers(data.users || []);
+      } catch (error) {
+        userTableContainer.innerHTML = '';
+
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent =
+          '加载失败：' + error.message;
+
+        userTableContainer.appendChild(empty);
+      }
+    }
+
+    async function addUser() {
+      const chatId = chatIdInput.value.trim();
+
+      if (!/^\\d{5,20}$/.test(chatId)) {
+        showMessage(
+          '请输入正确的纯数字 Telegram 用户 ID',
+          'error'
+        );
+        return;
+      }
+
+      addUserButton.disabled = true;
+
+      try {
+        const response = await fetch('/api/users/add', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify({
+            chat_id: chatId
+          })
+        });
+
+        const data = await parseResponse(response);
+
+        showMessage(
+          data.message || '用户添加成功',
+          'success'
+        );
+
+        chatIdInput.value = '';
+
+        await loadUsers();
+      } catch (error) {
+        showMessage(
+          '添加失败：' + error.message,
+          'error'
+        );
+      } finally {
+        addUserButton.disabled = false;
+      }
+    }
+
+    async function deleteUser(chatId) {
+      const confirmed = window.confirm(
+        '确定取消用户 ' + chatId + ' 的使用权限吗？\\n\\n' +
+        '该操作不会删除用户已经上传的文件。'
+      );
+
+      if (!confirmed) {
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/users/delete', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify({
+            chat_id: chatId
+          })
+        });
+
+        const data = await parseResponse(response);
+
+        showMessage(
+          data.message || '用户权限已删除',
+          'success'
+        );
+
+        await loadUsers();
+      } catch (error) {
+        showMessage(
+          '删除失败：' + error.message,
+          'error'
+        );
+      }
+    }
+
+    addUserButton.addEventListener(
+      'click',
+      addUser
+    );
+
+    chatIdInput.addEventListener(
+      'keydown',
+      function(event) {
+        if (event.key === 'Enter') {
+          addUser();
+        }
+      }
+    );
+
+    refreshButton.addEventListener(
+      'click',
+      loadUsers
+    );
+
+    loadUsers();
+  </script>
+</body>
+</html>`;
+}
 function generateAdminPage(fileCards, categoryOptions) {
   return `<!DOCTYPE html>
   <html lang="zh-CN">
@@ -4044,7 +5437,18 @@ function generateAdminPage(fileCards, categoryOptions) {
             <option value="">所有分类</option>
             ${categoryOptions}
           </select>
-          <a href="/upload" class="return-btn">返回上传</a>
+          
+          <a
+            href="/users"
+            class="return-btn"
+            style="background:#8e44ad;"
+          >
+            用户管理
+          </a>
+          
+          <a href="/upload" class="return-btn">
+            返回上传
+          </a>
         </div>
       </div>
       <div class="action-bar">
