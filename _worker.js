@@ -309,10 +309,40 @@ async function checkAndAddMissingColumns(config) {
     await ensureColumnExists(config, 'user_settings', 'waiting_for', 'TEXT');
     await ensureColumnExists(config, 'user_settings', 'editing_file_id', 'TEXT');
     await ensureColumnExists(config, 'user_settings', 'current_category_id', 'INTEGER');
+    await ensureColumnExists(config, 'user_settings', 'is_processing', 'INTEGER');   // 新增
+    await ensureColumnExists(config, 'user_settings', 'upload_seq', 'INTEGER');      // 新增：用于排队序号
     return true;
   } catch (error) {
     console.error('检查并添加缺失列失败:', error);
     return false;
+  }
+}
+// 尝试获取该 chat_id 的上传锁，同时分配一个排队序号
+async function acquireUploadLock(chatId, config, maxWaitMs = 20000, pollMs = 300, lockTimeoutMs = 60000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const now = Date.now();
+    const result = await config.database.prepare(
+      `UPDATE user_settings 
+       SET is_processing = 1, lock_time = ?
+       WHERE chat_id = ? AND (
+         is_processing IS NULL OR is_processing = 0 
+         OR (lock_time IS NOT NULL AND ? - lock_time > ?)
+       )`
+    ).bind(now, chatId, now, lockTimeoutMs).run();
+    if (result.meta && result.meta.changes > 0) return true;
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+  return false;
+}
+
+async function releaseUploadLock(chatId, config) {
+  try {
+    await config.database.prepare(
+      'UPDATE user_settings SET is_processing = 0 WHERE chat_id = ?'
+    ).bind(chatId).run();
+  } catch (error) {
+    console.error('释放上传锁失败:', error);
   }
 }
 async function ensureColumnExists(config, tableName, columnName, columnType) {
@@ -813,7 +843,16 @@ async function handleTelegramWebhook(request, config) {
           isDocument = false;
         }
         if (file) {
-          await handleMediaUpload(chatId, file, isDocument, config, userSetting);
+          const gotLock = await acquireUploadLock(chatId, config);
+          if (!gotLock) {
+            await sendMessage(chatId, "⏳ 有其他文件正在处理中，请稍后重试或稍等片刻", config.tgBotToken);
+            return new Response('OK');
+          }
+          try {
+            await handleMediaUpload(chatId, file, isDocument, config, userSetting);
+          } finally {
+            await releaseUploadLock(chatId, config); // 无论成功失败都要释放锁，避免后续文件永远卡住
+          }
         } else {
           await sendMessage(chatId, "❌ 无法识别的文件类型", config.tgBotToken);
         }
@@ -829,7 +868,16 @@ async function handleTelegramWebhook(request, config) {
         }
         if (fileField) {
           console.log(`找到未明确处理的文件类型: ${fileField}`, JSON.stringify(message[fileField]));
-          await handleMediaUpload(chatId, message[fileField], true, config, userSetting);
+          const gotLock = await acquireUploadLock(chatId, config);
+          if (!gotLock) {
+            await sendMessage(chatId, "⏳ 有其他文件正在处理中，请稍后重试", config.tgBotToken);
+            return new Response('OK');
+          }
+          try {
+            await handleMediaUpload(chatId, message[fileField], true, config, userSetting);
+          } finally {
+            await releaseUploadLock(chatId, config);
+          }
         } else if (userSetting.waiting_for === 'edit_suffix_input_file' && message.text) {
           try {
             const userInput = message.text.trim();
@@ -3288,44 +3336,56 @@ function generateUploadPage(categoryOptions, storageType) {
           await uploadFile(file);
         }
       }
-      async function uploadFile(file) {
-        const preview = createPreview(file);
-        previewArea.appendChild(preview);
-        const xhr = new XMLHttpRequest();
-        const progressTrack = preview.querySelector('.progress-track');
-        const progressText = preview.querySelector('.progress-text');
-        xhr.upload.addEventListener('progress', (e) => {
-          if (e.lengthComputable) {
-            const percent = Math.round((e.loaded / e.total) * 100);
-            progressTrack.style.width = \`\${percent}%\`;
-            progressText.textContent = \`\${percent}%\`;
-          }
-        });
-        xhr.addEventListener('load', () => {
-          try {
-            const data = JSON.parse(xhr.responseText);
-            const progressText = preview.querySelector('.progress-text');
-            if (xhr.status >= 200 && xhr.status < 300 && data.status === 1) {
-              progressText.textContent = data.msg;
-              uploadedUrls.push(data.url);
-              updateUrlArea();
-              preview.classList.add('success');
-            } else {
-              const errorMsg = [data.msg, data.error || '未知错误'].filter(Boolean).join(' | ');
-              progressText.textContent = errorMsg;
+      function uploadFile(file) {
+        return new Promise((resolve) => {
+          const preview = createPreview(file);
+          previewArea.appendChild(preview);
+          const xhr = new XMLHttpRequest();
+          const progressTrack = preview.querySelector('.progress-track');
+          const progressText = preview.querySelector('.progress-text');
+      
+          xhr.upload.addEventListener('progress', (e) => {
+            if (e.lengthComputable) {
+              const percent = Math.round((e.loaded / e.total) * 100);
+              progressTrack.style.width = `${percent}%`;
+              progressText.textContent = `${percent}%`;
+            }
+          });
+      
+          xhr.addEventListener('load', () => {
+            try {
+              const data = JSON.parse(xhr.responseText);
+              const progressText = preview.querySelector('.progress-text');
+              if (xhr.status >= 200 && xhr.status < 300 && data.status === 1) {
+                progressText.textContent = data.msg;
+                uploadedUrls.push(data.url);
+                updateUrlArea();
+                preview.classList.add('success');
+              } else {
+                const errorMsg = [data.msg, data.error || '未知错误'].filter(Boolean).join(' | ');
+                progressText.textContent = errorMsg;
+                preview.classList.add('error');
+              }
+            } catch (e) {
+              preview.querySelector('.progress-text').textContent = '✗ 响应解析失败';
               preview.classList.add('error');
             }
-          } catch (e) {
-            preview.querySelector('.progress-text').textContent = '✗ 响应解析失败';
+            resolve();          // ← 关键：上传"结束"(无论成功失败)才 resolve
+          });
+      
+          xhr.addEventListener('error', () => {
+            preview.querySelector('.progress-text').textContent = '✗ 网络错误';
             preview.classList.add('error');
-          }
+            resolve();          // ← 网络异常也要 resolve，否则整个队列会卡死
+          });
+      
+          const formData = new FormData();
+          formData.append('file', file);
+          formData.append('category', categorySelect.value);
+          formData.append('storage_type', document.querySelector('.storage-btn.active').dataset.storage);
+          xhr.open('POST', '/upload');
+          xhr.send(formData);
         });
-        const formData = new FormData();
-        formData.append('file', file);
-        formData.append('category', categorySelect.value);
-        formData.append('storage_type', document.querySelector('.storage-btn.active').dataset.storage);
-        xhr.open('POST', '/upload');
-        xhr.send(formData);
       }
       function createPreview(file) {
         const div = document.createElement('div');
