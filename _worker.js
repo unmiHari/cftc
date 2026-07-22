@@ -53,6 +53,7 @@ async function recreateAllTables(config) {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
+
     await config.database.prepare(`
       CREATE TABLE IF NOT EXISTS user_settings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,10 +62,13 @@ async function recreateAllTables(config) {
         current_category_id INTEGER,
         waiting_for TEXT,
         editing_file_id TEXT,
+        is_processing INTEGER DEFAULT 0,
+        lock_time INTEGER,
+        upload_seq INTEGER DEFAULT 0,
         FOREIGN KEY (current_category_id) REFERENCES categories(id)
       )
     `).run();
-    
+
     await config.database.prepare(`
       CREATE TABLE IF NOT EXISTS allowed_users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,7 +77,7 @@ async function recreateAllTables(config) {
         created_at INTEGER NOT NULL
       )
     `).run();
-    
+
     await config.database.prepare(`
       CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,12 +91,46 @@ async function recreateAllTables(config) {
         storage_type TEXT DEFAULT 'telegram',
         category_id INTEGER,
         chat_id TEXT,
+        custom_suffix TEXT,
+        is_chunked INTEGER NOT NULL DEFAULT 0,
+        chunk_count INTEGER NOT NULL DEFAULT 0,
+        upload_id TEXT,
         FOREIGN KEY (category_id) REFERENCES categories(id)
       )
     `).run();
+
+    // 分片先以 upload_id 暂存；完成后再绑定 files.id。
+    await config.database.prepare(`
+      CREATE TABLE IF NOT EXISTS file_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        upload_id TEXT NOT NULL,
+        file_id INTEGER,
+        chat_id TEXT NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        total_chunks INTEGER NOT NULL,
+        telegram_file_id TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        chunk_size INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(upload_id, chunk_index),
+        FOREIGN KEY (file_id) REFERENCES files(id)
+      )
+    `).run();
+
+    await config.database.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_file_chunks_file_id
+      ON file_chunks(file_id, chunk_index)
+    `).run();
+
+    await config.database.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_file_chunks_upload_id
+      ON file_chunks(upload_id, chunk_index)
+    `).run();
+
     await config.database.prepare(`
       INSERT OR IGNORE INTO categories (name) VALUES ('默认分类')
     `).run();
+
     return true;
   } catch (error) {
     console.error("重新创建表失败:", error);
@@ -105,7 +143,8 @@ async function validateDatabaseStructure(config) {
       'categories',
       'user_settings',
       'allowed_users',
-      'files'
+      'files',
+      'file_chunks'
     ];
     for (const table of tables) {
       try {
@@ -114,7 +153,7 @@ async function validateDatabaseStructure(config) {
         if (error.message.includes('no such table')) {
           console.log(`表 ${table} 不存在，尝试重新创建所有表...`);
           await recreateAllTables(config);
-          return true;
+          continue;
         }
         throw error;
       }
@@ -153,7 +192,23 @@ async function validateDatabaseStructure(config) {
         { name: 'mime_type', type: 'TEXT' },
         { name: 'storage_type', type: 'TEXT' },
         { name: 'category_id', type: 'INTEGER' },
-        { name: 'chat_id', type: 'TEXT' }
+        { name: 'chat_id', type: 'TEXT' },
+        { name: 'custom_suffix', type: 'TEXT' },
+        { name: 'is_chunked', type: 'INTEGER' },
+        { name: 'chunk_count', type: 'INTEGER' },
+        { name: 'upload_id', type: 'TEXT' }
+      ],
+      file_chunks: [
+        { name: 'id', type: 'INTEGER' },
+        { name: 'upload_id', type: 'TEXT' },
+        { name: 'file_id', type: 'INTEGER' },
+        { name: 'chat_id', type: 'TEXT' },
+        { name: 'chunk_index', type: 'INTEGER' },
+        { name: 'total_chunks', type: 'INTEGER' },
+        { name: 'telegram_file_id', type: 'TEXT' },
+        { name: 'message_id', type: 'INTEGER' },
+        { name: 'chunk_size', type: 'INTEGER' },
+        { name: 'created_at', type: 'INTEGER' }
       ]
     };
     for (const [table, expectedColumns] of Object.entries(tableStructures)) {
@@ -176,6 +231,20 @@ async function validateDatabaseStructure(config) {
         }
       }
     }
+    await config.database.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_file_chunks_file_id
+      ON file_chunks(file_id, chunk_index)
+    `).run();
+    await config.database.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_file_chunks_upload_id
+      ON file_chunks(upload_id, chunk_index)
+    `).run();
+    await config.database.prepare(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_files_upload_id
+      ON files(upload_id)
+      WHERE upload_id IS NOT NULL
+    `).run();
+
     console.log('检查默认分类...');
     const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?')
       .bind('默认分类').first();
@@ -266,16 +335,13 @@ async function recreateUserSettingsTable(config) {
 async function recreateFilesTable(config) {
   console.log('开始重建文件表...');
   try {
-    console.log('备份现有数据...');
     const existingData = await config.database.prepare('SELECT * FROM files').all();
-    console.log('删除现有表...');
     await config.database.prepare('DROP TABLE IF EXISTS files').run();
-    console.log('创建新表...');
     await config.database.prepare(`
       CREATE TABLE files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         url TEXT NOT NULL,
-        fileId TEXT NOT NULL,
+        fileId TEXT,
         message_id INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         file_name TEXT,
@@ -285,39 +351,45 @@ async function recreateFilesTable(config) {
         storage_type TEXT NOT NULL DEFAULT 'telegram',
         category_id INTEGER,
         custom_suffix TEXT,
+        is_chunked INTEGER NOT NULL DEFAULT 0,
+        chunk_count INTEGER NOT NULL DEFAULT 0,
+        upload_id TEXT,
         FOREIGN KEY (category_id) REFERENCES categories(id)
       )
     `).run();
-    console.log('恢复数据...');
+
     if (existingData && existingData.results && existingData.results.length > 0) {
-      console.log(`恢复 ${existingData.results.length} 条记录...`);
       for (const row of existingData.results) {
-        const timestamp = row.created_at || Math.floor(Date.now() / 1000);
-        const messageId = row.message_id || 0;
         try {
           await config.database.prepare(`
             INSERT INTO files (
-              url, fileId, message_id, created_at, file_name, file_size, 
-              mime_type, chat_id, storage_type, category_id, custom_suffix
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              id, url, fileId, message_id, created_at, file_name, file_size,
+              mime_type, chat_id, storage_type, category_id, custom_suffix,
+              is_chunked, chunk_count, upload_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `).bind(
-            row.url, 
-            row.fileId || row.url, 
-            messageId,
-            timestamp,
-            row.file_name, 
-            row.file_size, 
-            row.mime_type, 
-            row.chat_id, 
-            row.storage_type || 'telegram', 
+            row.id || null,
+            row.url,
+            row.fileId || row.url,
+            row.message_id || 0,
+            row.created_at || Date.now(),
+            row.file_name,
+            row.file_size,
+            row.mime_type,
+            row.chat_id,
+            row.storage_type || 'telegram',
             row.category_id,
-            row.custom_suffix
+            row.custom_suffix,
+            Number(row.is_chunked || 0),
+            Number(row.chunk_count || 0),
+            row.upload_id || null
           ).run();
-        } catch (e) {
-          console.error(`恢复记录失败: ${e.message}`, row);
+        } catch (error) {
+          console.error(`恢复记录失败: ${error.message}`, row);
         }
       }
     }
+
     console.log('文件表重建完成!');
     return true;
   } catch (error) {
@@ -329,12 +401,16 @@ async function checkAndAddMissingColumns(config) {
   try {
     await ensureColumnExists(config, 'files', 'custom_suffix', 'TEXT');
     await ensureColumnExists(config, 'files', 'chat_id', 'TEXT');
+    await ensureColumnExists(config, 'files', 'is_chunked', 'INTEGER');
+    await ensureColumnExists(config, 'files', 'chunk_count', 'INTEGER');
+    await ensureColumnExists(config, 'files', 'upload_id', 'TEXT');
     await ensureColumnExists(config, 'user_settings', 'custom_suffix', 'TEXT');
     await ensureColumnExists(config, 'user_settings', 'waiting_for', 'TEXT');
     await ensureColumnExists(config, 'user_settings', 'editing_file_id', 'TEXT');
     await ensureColumnExists(config, 'user_settings', 'current_category_id', 'INTEGER');
-    await ensureColumnExists(config, 'user_settings', 'is_processing', 'INTEGER');   // 新增
-    await ensureColumnExists(config, 'user_settings', 'upload_seq', 'INTEGER');      // 新增：用于排队序号
+    await ensureColumnExists(config, 'user_settings', 'is_processing', 'INTEGER');
+    await ensureColumnExists(config, 'user_settings', 'lock_time', 'INTEGER');
+    await ensureColumnExists(config, 'user_settings', 'upload_seq', 'INTEGER');
     return true;
   } catch (error) {
     console.error('检查并添加缺失列失败:', error);
@@ -620,7 +696,13 @@ export default {
       tgAdminId: normalizeIdList(env.TG_ADMIN_ID),
       tgStorageChatId: String(env.TG_STORAGE_CHAT_ID || '').trim(),
       cookie: Number(env.COOKIE) || 7,
-      maxSizeMB: Number(env.MAX_SIZE_MB) || 20,
+      // MAX_SIZE_MB 是业务总上限；Telegram 单片上限由下面几项单独控制。
+      maxSizeMB: Number(env.MAX_SIZE_MB) || 1024,
+      telegramPhotoLimitMB: 10,
+      telegramFileLimitMB: 50,
+      telegramDownloadLimitMB: 20,
+      // 公开 Bot API 的 getFile 下载上限仍为 20MB，因此分片必须低于 20MB。
+      telegramChunkSizeMB: Math.min(19, Math.max(1, Number(env.TG_CHUNK_SIZE_MB) || 19)),
       bucket: env.BUCKET,
       fileCache: new Map(),
       fileCacheTTL: 3600000,
@@ -651,6 +733,9 @@ export default {
     const protectedPaths = [
       '/',
       '/upload',
+      '/upload-chunk',
+      '/upload-complete',
+      '/upload-abort',
       '/admin',
     
       // 用户管理页面和接口
@@ -741,6 +826,18 @@ export default {
           console.log('[Route] Handling /upload request.');
           return handleUploadRequest(request, config);
       },
+      '/upload-chunk': async () => {
+          console.log('[Route] Handling /upload-chunk request.');
+          return handleUploadChunkRequest(request, config);
+      },
+      '/upload-complete': async () => {
+          console.log('[Route] Handling /upload-complete request.');
+          return handleUploadCompleteRequest(request, config);
+      },
+      '/upload-abort': async () => {
+          console.log('[Route] Handling /upload-abort request.');
+          return handleUploadAbortRequest(request, config);
+      },
       '/admin': async () => {
           console.log('[Route] Handling /admin request.');
           return handleAdminRequest(request, config);
@@ -772,7 +869,13 @@ export default {
       '/update-suffix': () => handleUpdateSuffixRequest(request, config),
       '/config': () => {
           console.log('[Route] Handling /config request.');
-          const safeConfig = { maxSizeMB: config.maxSizeMB };
+          const safeConfig = {
+            maxSizeMB: config.maxSizeMB,
+            telegramPhotoLimitMB: config.telegramPhotoLimitMB,
+            telegramFileLimitMB: config.telegramFileLimitMB,
+            telegramDownloadLimitMB: config.telegramDownloadLimitMB,
+            telegramChunkSizeMB: config.telegramChunkSizeMB
+          };
           return new Response(JSON.stringify(safeConfig), {
               headers: { 
                   'Content-Type': 'application/json',
@@ -1287,41 +1390,13 @@ async function handleTelegramWebhook(request, config) {
           const fileName = fileToDelete.file_name || getFileName(fileToDelete.url);
           console.log(`[TG Delete] 找到匹配文件: ID=${fileToDelete.id}, 名称=${fileName}, URL=${fileToDelete.url}`);
           console.log(`[TG Delete] 开始删除: ID=${fileToDelete.id}, 类型=${fileToDelete.storage_type}, TGMsgID=${fileToDelete.message_id}, R2ID=${fileToDelete.fileId}`);
-          let storageDeleteSuccess = false;
-          if (fileToDelete.storage_type === 'r2' && config.bucket && fileToDelete.fileId) {
-            try {
-              await config.bucket.delete(fileToDelete.fileId);
-              console.log(`[TG Delete] R2文件已删除: ${fileToDelete.fileId}`);
-              storageDeleteSuccess = true;
-            } catch (r2Error) {
-              console.error(`[TG Delete] 从R2删除失败: ${r2Error.message}`);
-            }
-          } else if (fileToDelete.storage_type === 'telegram' && fileToDelete.message_id && fileToDelete.message_id !== -1 && fileToDelete.message_id !== 0) {
-            try {
-              const deleteTgMsgResponse = await fetch(
-                `https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${fileToDelete.message_id}`
-              );
-              const deleteTgMsgResult = await deleteTgMsgResponse.json();
-              if (deleteTgMsgResponse.ok && deleteTgMsgResult.ok) {
-                console.log(`[TG Delete] Telegram消息已删除: ${fileToDelete.message_id}`);
-                storageDeleteSuccess = true;
-              } else {
-                console.warn(`[TG Delete] 删除Telegram消息失败 ${fileToDelete.message_id}: ${JSON.stringify(deleteTgMsgResult)}`);
-              }
-            } catch (tgError) {
-              console.error(`[TG Delete] 删除Telegram消息错误: ${tgError.message}`);
-            }
-          } else {
-            console.log(`[TG Delete] ID ${fileToDelete.id} 没有关联的存储文件/消息需要删除 (类型: ${fileToDelete.storage_type}, TGMsgID: ${fileToDelete.message_id}, R2ID: ${fileToDelete.fileId})`);
-            storageDeleteSuccess = true;
-          }
-          await config.database.prepare('DELETE FROM files WHERE id = ?').bind(fileToDelete.id).run();
+          await deleteStoredFileRecord(fileToDelete, config);
           await resetWaitingState(
             chatId,
             userSetting,
             config
           );
-          console.log(`[TG Delete] 数据库记录已删除: ID=${fileToDelete.id}`);
+          console.log(`[TG Delete] 存储对象、分片和数据库记录已删除: ID=${fileToDelete.id}`);
           const cacheKey = `file:${fileName}`;
           if (config.fileCache && config.fileCache.has(cacheKey)) {
             config.fileCache.delete(cacheKey);
@@ -1745,7 +1820,7 @@ async function findFileRecord(rawInput, chatId, config) {
 
   if (isUrl) {
     let rec = await config.database.prepare(
-      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE url = ? AND (chat_id = ? OR chat_id IS NULL)'
+      'SELECT * FROM files WHERE url = ? AND (chat_id = ? OR chat_id IS NULL)'
     ).bind(input, chatId).first();
     if (rec) return rec;
 
@@ -1753,21 +1828,21 @@ async function findFileRecord(rawInput, chatId, config) {
       ? 'http://' + input.slice('https://'.length)
       : 'https://' + input.slice('http://'.length);
     rec = await config.database.prepare(
-      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE url = ? AND (chat_id = ? OR chat_id IS NULL)'
+      'SELECT * FROM files WHERE url = ? AND (chat_id = ? OR chat_id IS NULL)'
     ).bind(altUrl, chatId).first();
     if (rec) return rec;
   }
 
   if (basename) {
     let rec = await config.database.prepare(
-      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE (fileId = ? OR url LIKE ?) AND (chat_id = ? OR chat_id IS NULL) ORDER BY created_at DESC LIMIT 1'
+      'SELECT * FROM files WHERE (fileId = ? OR url LIKE ?) AND (chat_id = ? OR chat_id IS NULL) ORDER BY created_at DESC LIMIT 1'
     ).bind(basename, `%/${basename}`, chatId).first();
     if (rec) return rec;
   }
 
   if (!isUrl) {
     let rec = await config.database.prepare(
-      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE (file_name = ? OR url LIKE ?) AND (chat_id = ? OR chat_id IS NULL) ORDER BY created_at DESC LIMIT 1'
+      'SELECT * FROM files WHERE (file_name = ? OR url LIKE ?) AND (chat_id = ? OR chat_id IS NULL) ORDER BY created_at DESC LIMIT 1'
     ).bind(input, `%/${input}`, chatId).first();
     if (rec) return rec;
   }
@@ -2478,256 +2553,791 @@ async function handleCallbackQuery(update, config, userSetting) {
     await sendMessage(chatId, `❌ 处理请求时出错: ${error.message}`, config.tgBotToken);
   }
 }
-async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
-  const processingMessage = await sendMessage(chatId, "⏳ 正在处理您的文件，请稍候...", config.tgBotToken);
-  const processingMessageId = processingMessage && processingMessage.result ? processingMessage.result.message_id : null;
-  try {
-    console.log('原始文件信息:', JSON.stringify(file));
-    const filePathPromise = fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.file_id}`)
-      .then(response => response.json());
-    let categoryId = null;
-    let categoryPromise = null;
-    if (userSetting && userSetting.current_category_id) {
-      categoryId = userSetting.current_category_id;
-    } else {
-      categoryPromise = config.database.prepare('SELECT id FROM categories WHERE name = ?')
-        .bind('默认分类').first()
-        .then(async (defaultCategory) => {
-          if (!defaultCategory) {
-            try {
-              console.log('默认分类不存在，正在创建...');
-              const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
-                .bind('默认分类', Date.now()).run();
-              const newDefaultId = result.meta && result.meta.last_row_id;
-              if (newDefaultId) {
-                return { id: newDefaultId };
-              }
-            } catch (error) {
-              console.error('创建默认分类失败:', error);
-            }
-          }
-          return defaultCategory;
-        });
-    }
-    const data = await filePathPromise;
-    if (!data.ok) throw new Error(`获取文件路径失败: ${JSON.stringify(data)}`);
-    console.log('获取到文件路径:', data.result.file_path);
-    const fileUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
-    const fileResponse = await fetch(fileUrl);
-    if (!fileResponse.ok) throw new Error(`获取文件内容失败: ${fileResponse.status} ${fileResponse.statusText}`);
-    const contentLength = fileResponse.headers.get('content-length');
-    if (contentLength && parseInt(contentLength) > config.maxSizeMB * 1024 * 1024) {
-      if (processingMessageId) {
-        await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: processingMessageId
-          })
-        }).catch(err => console.error('删除处理消息失败:', err));
-      }
-      await sendMessage(chatId, `❌ 文件超过${config.maxSizeMB}MB限制`, config.tgBotToken);
-      return;
-    }
-    fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        message_id: processingMessageId,
-        text: "⏳ 文件已接收，正在上传到存储..."
-      })
-    }).catch(err => console.error('更新处理消息失败:', err));
-    if (categoryPromise) {
-      const defaultCategory = await categoryPromise;
-      if (defaultCategory) {
-        categoryId = defaultCategory.id;
-      }
-    }
-    let fileName = '';
-    let ext = '';
-    let mimeType = file.mime_type || 'application/octet-stream';
-    const filePathExt = data.result.file_path.split('.').pop().toLowerCase();
-    if (file.file_name) {
-      fileName = file.file_name;
-      ext = (fileName.split('.').pop() || '').toLowerCase();
-    } 
-    else if (filePathExt && filePathExt !== data.result.file_path.toLowerCase()) {
-      ext = filePathExt;
-    } 
-    else {
-      ext = getExtensionFromMime(mimeType);
-    }
-    if (!fileName) {
-      if (file.video_note) {
-        fileName = `video_note_${Date.now()}.${ext}`;
-      } else if (file.voice) {
-        fileName = `voice_message_${Date.now()}.${ext}`;
-      } else if (file.audio) {
-        fileName = (file.audio.title || `audio_${Date.now()}`) + `.${ext}`;
-      } else if (file.video) {
-        fileName = `video_${Date.now()}.${ext}`;
-      } else {
-        fileName = `file_${Date.now()}.${ext}`;
-      }
-    }
-    if (!mimeType || mimeType === 'application/octet-stream') {
-      mimeType = getContentType(ext);
-    }
-    const mimeParts = mimeType.split('/');
-    const mainType = mimeParts[0] || '';
-    const subType = mimeParts[1] || '';
-    console.log('处理文件:', JSON.stringify({ 
-      fileName, 
-      ext, 
-      mimeType, 
-      mainType, 
-      subType,
-      size: contentLength,
-      filePath: data.result.file_path
-    }));
-    const storageType = userSetting && userSetting.storage_type ? userSetting.storage_type : 'r2';
-    let finalUrl, dbFileId, dbMessageId;
-    const key = generateSafeKey(fileName); // 使用随机安全key，杂乱的原始文件名只保存进 file_name 字段
-    if (storageType === 'r2' && config.bucket) {
-      const arrayBuffer = await fileResponse.arrayBuffer();
-      await config.bucket.put(key, arrayBuffer, { 
-        httpMetadata: { contentType: mimeType } 
-      });
-      finalUrl = `https://${config.domain}/${key}`;
-      dbFileId = key;
-      dbMessageId = -1;
-    } else {
-      let method = 'sendDocument';
-      let field = 'document';
-      let messageId = null;
-      let fileId = null;
-      if (mainType === 'image' && !['svg+xml', 'x-icon'].includes(subType)) {
-        method = 'sendPhoto';
-        field = 'photo';
-      } else if (mainType === 'video') {
-        method = 'sendVideo';
-        field = 'video';
-      } else if (mainType === 'audio') {
-        method = 'sendAudio';
-        field = 'audio';
-      } else {
-        method = 'sendDocument';
-        field = 'document';
-      }
-      console.log('Telegram上传方法:', { method, field });
-      const arrayBuffer = await fileResponse.arrayBuffer();
 
-      if (!config.tgStorageChatId) {
-        throw new Error(
-          '未配置 TG_STORAGE_CHAT_ID，无法使用 Telegram 存储'
-        );
+const TELEGRAM_MANIFEST_MAGIC = 'tgstate-blob';
+
+function normalizeUploadId(value) {
+  const uploadId = String(value || '').trim();
+  return /^[a-zA-Z0-9_-]{16,80}$/.test(uploadId) ? uploadId : null;
+}
+
+function sanitizeTelegramFileName(fileName, fallback = 'file.bin') {
+  const value = String(fileName || fallback)
+    .replace(/[\\/\0\r\n\t]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return (value || fallback).slice(0, 180);
+}
+
+function getTelegramChunkSizeBytes(config) {
+  return Math.floor(Number(config.telegramChunkSizeMB || 19) * 1024 * 1024);
+}
+
+function shouldUseTelegramChunks(fileSize, config) {
+  return Number(fileSize || 0) > getTelegramChunkSizeBytes(config);
+}
+
+function chooseTelegramUploadMode(mimeType, fileSize, config) {
+  const size = Number(fileSize || 0);
+  const mime = String(mimeType || 'application/octet-stream').toLowerCase();
+  const photoLimit = Number(config.telegramPhotoLimitMB || 10) * 1024 * 1024;
+
+  if (
+    mime.startsWith('image/') &&
+    !['image/svg+xml', 'image/x-icon', 'image/vnd.microsoft.icon'].includes(mime) &&
+    size <= photoLimit
+  ) {
+    return { method: 'sendPhoto', field: 'photo' };
+  }
+  if (mime.startsWith('video/')) return { method: 'sendVideo', field: 'video' };
+  if (mime.startsWith('audio/')) return { method: 'sendAudio', field: 'audio' };
+  return { method: 'sendDocument', field: 'document' };
+}
+
+function extractTelegramUploadedFile(result, field) {
+  let fileId = null;
+  if (field === 'photo') {
+    const photos = result.photo || [];
+    fileId = photos.length ? photos[photos.length - 1].file_id : null;
+  } else if (field === 'video') {
+    fileId = result.video && result.video.file_id;
+  } else if (field === 'audio') {
+    fileId = result.audio && result.audio.file_id;
+  } else {
+    fileId = result.document && result.document.file_id;
+  }
+  return {
+    fileId,
+    messageId: result.message_id
+  };
+}
+
+async function uploadBlobToTelegram(
+  blob,
+  fileName,
+  mimeType,
+  config,
+  options = {}
+) {
+  if (!config.tgBotToken || !config.tgStorageChatId) {
+    throw new Error('未配置 Telegram 存储参数 (TG_BOT_TOKEN 和 TG_STORAGE_CHAT_ID)');
+  }
+
+  const method = options.method || 'sendDocument';
+  const field = options.field || 'document';
+  const safeName = sanitizeTelegramFileName(fileName);
+  const formData = new FormData();
+  formData.append('chat_id', config.tgStorageChatId);
+  formData.append(field, blob, safeName);
+  if (options.caption && field !== 'photo') {
+    formData.append('caption', String(options.caption).slice(0, 1024));
+  }
+
+  const response = await fetch(
+    `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
+    { method: 'POST', body: formData }
+  );
+  const responseText = await response.text();
+  let data = null;
+  try {
+    data = JSON.parse(responseText);
+  } catch (_) {}
+
+  if (!response.ok || !data || !data.ok) {
+    const description = data && data.description ? data.description : responseText;
+    throw new Error(`Telegram ${method} 失败: ${description || response.status}`);
+  }
+
+  const uploaded = extractTelegramUploadedFile(data.result, field);
+  if (!uploaded.fileId || !uploaded.messageId) {
+    throw new Error(`Telegram ${method} 成功但未返回有效 file_id/message_id`);
+  }
+
+  return uploaded;
+}
+
+async function uploadSingleFileToTelegram(blob, fileName, mimeType, config) {
+  const size = Number(blob.size || 0);
+  const mode = chooseTelegramUploadMode(mimeType, size, config);
+  const caption = `File: ${sanitizeTelegramFileName(fileName)}\nType: ${mimeType || 'application/octet-stream'}\nSize: ${formatSize(size)}`;
+
+  try {
+    return await uploadBlobToTelegram(blob, fileName, mimeType, config, {
+      ...mode,
+      caption
+    });
+  } catch (error) {
+    if (mode.method === 'sendDocument') throw error;
+    console.warn(`${mode.method} 失败，改用 sendDocument:`, error.message);
+    return uploadBlobToTelegram(blob, fileName, mimeType, config, {
+      method: 'sendDocument',
+      field: 'document',
+      caption
+    });
+  }
+}
+
+async function deleteTelegramStorageMessage(messageId, config) {
+  if (!messageId || Number(messageId) <= 0 || !config.tgStorageChatId) return true;
+  try {
+    const response = await fetch(
+      `https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: config.tgStorageChatId,
+          message_id: Number(messageId)
+        })
       }
-      const tgFormData = new FormData();
-      tgFormData.append('chat_id', config.tgStorageChatId);
-      const blob = new Blob([arrayBuffer], { type: mimeType });
-      tgFormData.append(field, blob, fileName);
-      if (field !== 'photo') {
-        tgFormData.append('caption', `File: ${fileName}\nType: ${mimeType}\nSize: ${formatSize(parseInt(contentLength || '0'))}`);
-      }
-      const tgResponse = await fetch(
-        `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
-        { method: 'POST', body: tgFormData }
-      );
-      if (!tgResponse.ok) {
-        const errorText = await tgResponse.text();
-        console.error('Telegram API错误:', errorText);
-        if (method !== 'sendDocument') {
-          console.log('尝试使用sendDocument方法重新上传');
-          const retryFormData = new FormData();
-          retryFormData.append('chat_id', config.tgStorageChatId);
-          retryFormData.append('document', blob, fileName);
-          retryFormData.append('caption', `File: ${fileName}\nType: ${mimeType}\nSize: ${formatSize(parseInt(contentLength || '0'))}`);
-          const retryResponse = await fetch(
-            `https://api.telegram.org/bot${config.tgBotToken}/sendDocument`,
-            { method: 'POST', body: retryFormData }
-          );
-          if (!retryResponse.ok) {
-            console.error('Telegram文档上传也失败:', await retryResponse.text());
-            throw new Error('Telegram文件上传失败');
-          }
-          const retryData = await retryResponse.json();
-          const retryResult = retryData.result;
-          messageId = retryResult.message_id;
-          fileId = retryResult.document?.file_id;
-          if (!fileId || !messageId) {
-            throw new Error('重试上传后仍未获取到有效的文件ID');
-          }
-        } else {
-          throw new Error('Telegram参数配置错误: ' + errorText);
-        }
-      } else {
-        const tgData = await tgResponse.json();
-        const result = tgData.result;
-        messageId = result.message_id;
-        if (field === 'photo') {
-          const photos = result.photo;
-          fileId = photos[photos.length - 1]?.file_id; 
-        } else if (field === 'video') {
-          fileId = result.video?.file_id;
-        } else if (field === 'audio') {
-          fileId = result.audio?.file_id;
-        } else {
-          fileId = result.document?.file_id;
-        }
-      }
-      if (!fileId) throw new Error('未获取到文件ID');
-      if (!messageId) throw new Error('未获取到tg消息ID');
-      finalUrl = `https://${config.domain}/${key}`;
-      dbFileId = fileId;
-      dbMessageId = messageId;
+    );
+    const data = await response.json().catch(() => null);
+    if (response.ok && data && data.ok) return true;
+    const description = data && data.description ? data.description : '';
+    if (/message to delete not found|message can't be deleted/i.test(description)) {
+      return false;
     }
-    await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        message_id: processingMessageId,
-        text: "⏳ 正在写入数据库..."
-      })
-    }).catch(err => console.error('更新处理消息失败:', err));
-    const time = Date.now(); 
-    await config.database.prepare(`
-      INSERT INTO files (
-        url, 
-        fileId, 
-        message_id, 
-        created_at, 
-        file_name, 
-        file_size, 
-        mime_type, 
-        chat_id, 
-        category_id, 
-        storage_type
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      finalUrl,
-      dbFileId,
-      dbMessageId,
-      time, 
-      fileName, 
-      contentLength,
+    console.warn(`删除 Telegram 消息 ${messageId} 失败:`, description || response.status);
+    return false;
+  } catch (error) {
+    console.warn(`删除 Telegram 消息 ${messageId} 出错:`, error.message);
+    return false;
+  }
+}
+
+async function savePendingChunk({
+  uploadId,
+  chatId,
+  chunkIndex,
+  totalChunks,
+  telegramFileId,
+  messageId,
+  chunkSize
+}, config) {
+  const result = await config.database.prepare(`
+    INSERT OR IGNORE INTO file_chunks (
+      upload_id, file_id, chat_id, chunk_index, total_chunks,
+      telegram_file_id, message_id, chunk_size, created_at
+    ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    uploadId,
+    chatId,
+    chunkIndex,
+    totalChunks,
+    telegramFileId,
+    messageId,
+    chunkSize,
+    Date.now()
+  ).run();
+
+  if (!result.meta || Number(result.meta.changes || 0) === 0) {
+    const existing = await config.database.prepare(`
+      SELECT telegram_file_id, message_id, chunk_size
+      FROM file_chunks
+      WHERE upload_id = ? AND chat_id = ? AND chunk_index = ?
+      LIMIT 1
+    `).bind(uploadId, chatId, chunkIndex).first();
+    if (existing) {
+      await deleteTelegramStorageMessage(messageId, config);
+      return existing;
+    }
+    throw new Error('保存分片记录失败');
+  }
+
+  return {
+    telegram_file_id: telegramFileId,
+    message_id: messageId,
+    chunk_size: chunkSize
+  };
+}
+
+async function uploadOneTelegramChunk(
+  chunk,
+  uploadId,
+  chunkIndex,
+  totalChunks,
+  originalFileName,
+  chatId,
+  config
+) {
+  const existing = await config.database.prepare(`
+    SELECT telegram_file_id, message_id, chunk_size
+    FROM file_chunks
+    WHERE upload_id = ? AND chat_id = ? AND chunk_index = ?
+    LIMIT 1
+  `).bind(uploadId, chatId, chunkIndex).first();
+  if (existing) return existing;
+
+  const partNumber = String(chunkIndex + 1).padStart(5, '0');
+  const safeOriginal = sanitizeTelegramFileName(originalFileName, 'large-file.bin');
+  const partName = `${safeOriginal}.part${partNumber}`;
+  const uploaded = await uploadBlobToTelegram(
+    chunk,
+    partName,
+    'application/octet-stream',
+    config,
+    {
+      method: 'sendDocument',
+      field: 'document',
+      caption: `blob [${chunkIndex + 1}/${totalChunks}] - ${safeOriginal}`
+    }
+  );
+
+  return savePendingChunk({
+    uploadId,
+    chatId,
+    chunkIndex,
+    totalChunks,
+    telegramFileId: uploaded.fileId,
+    messageId: uploaded.messageId,
+    chunkSize: Number(chunk.size || 0)
+  }, config);
+}
+
+async function abortPendingChunkUpload(uploadId, chatId, config) {
+  const validUploadId = normalizeUploadId(uploadId);
+  if (!validUploadId) return 0;
+
+  const result = await config.database.prepare(`
+    SELECT id, message_id
+    FROM file_chunks
+    WHERE upload_id = ? AND chat_id = ? AND file_id IS NULL
+    ORDER BY chunk_index
+  `).bind(validUploadId, chatId).all();
+  const chunks = result.results || [];
+
+  for (const chunk of chunks) {
+    await deleteTelegramStorageMessage(chunk.message_id, config);
+  }
+  await config.database.prepare(`
+    DELETE FROM file_chunks
+    WHERE upload_id = ? AND chat_id = ? AND file_id IS NULL
+  `).bind(validUploadId, chatId).run();
+  return chunks.length;
+}
+
+async function insertFileRecord(fileData, config) {
+  const result = await config.database.prepare(`
+    INSERT INTO files (
+      url, fileId, message_id, created_at, file_name, file_size,
+      mime_type, storage_type, category_id, chat_id,
+      is_chunked, chunk_count, upload_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    fileData.url,
+    fileData.fileId,
+    fileData.messageId,
+    fileData.createdAt || Date.now(),
+    fileData.fileName,
+    Number(fileData.fileSize || 0),
+    fileData.mimeType || 'application/octet-stream',
+    fileData.storageType || 'telegram',
+    fileData.categoryId || null,
+    fileData.chatId,
+    fileData.isChunked ? 1 : 0,
+    Number(fileData.chunkCount || 0),
+    fileData.uploadId || null
+  ).run();
+
+  let fileRowId = result.meta && result.meta.last_row_id;
+  if (!fileRowId && fileData.uploadId) {
+    const row = await config.database.prepare(`
+      SELECT id FROM files WHERE upload_id = ? LIMIT 1
+    `).bind(fileData.uploadId).first();
+    fileRowId = row && row.id;
+  }
+  if (!fileRowId) {
+    const row = await config.database.prepare(`
+      SELECT id FROM files WHERE url = ? ORDER BY id DESC LIMIT 1
+    `).bind(fileData.url).first();
+    fileRowId = row && row.id;
+  }
+  if (!fileRowId) throw new Error('写入文件记录后未能获取文件 ID');
+  return Number(fileRowId);
+}
+
+async function finalizeChunkedTelegramUpload({
+  uploadId,
+  chatId,
+  fileName,
+  fileSize,
+  mimeType,
+  categoryId,
+  key,
+  totalChunks
+}, config) {
+  const validUploadId = normalizeUploadId(uploadId);
+  if (!validUploadId) throw new Error('upload_id 格式无效');
+
+  const existingFile = await config.database.prepare(`
+    SELECT * FROM files WHERE upload_id = ? AND chat_id = ? LIMIT 1
+  `).bind(validUploadId, chatId).first();
+  if (existingFile) return existingFile;
+
+  const result = await config.database.prepare(`
+    SELECT * FROM file_chunks
+    WHERE upload_id = ? AND chat_id = ?
+    ORDER BY chunk_index ASC
+  `).bind(validUploadId, chatId).all();
+  const chunks = result.results || [];
+
+  if (chunks.length !== Number(totalChunks)) {
+    throw new Error(`分片不完整：应有 ${totalChunks} 片，实际 ${chunks.length} 片`);
+  }
+  for (let index = 0; index < chunks.length; index++) {
+    if (Number(chunks[index].chunk_index) !== index) {
+      throw new Error(`缺少第 ${index + 1} 个分片`);
+    }
+  }
+  const actualSize = chunks.reduce((sum, chunk) => sum + Number(chunk.chunk_size || 0), 0);
+  if (actualSize !== Number(fileSize)) {
+    throw new Error(`分片总大小不一致：应为 ${fileSize}，实际 ${actualSize}`);
+  }
+
+  const safeName = sanitizeTelegramFileName(fileName, 'large-file.bin');
+  const manifestText = [
+    TELEGRAM_MANIFEST_MAGIC,
+    safeName,
+    `size${fileSize}`,
+    ...chunks.map(chunk => chunk.telegram_file_id)
+  ].join('\n');
+  const manifestBlob = new Blob([manifestText], { type: 'text/plain;charset=UTF-8' });
+  const manifestUpload = await uploadBlobToTelegram(
+    manifestBlob,
+    'fileAll.txt',
+    'text/plain',
+    config,
+    {
+      method: 'sendDocument',
+      field: 'document',
+      caption: safeName
+    }
+  );
+
+  const finalKey = key || generateSafeKey(safeName);
+  const finalUrl = `https://${config.domain}/${finalKey}`;
+  let fileRowId = null;
+  try {
+    fileRowId = await insertFileRecord({
+      url: finalUrl,
+      fileId: manifestUpload.fileId,
+      messageId: manifestUpload.messageId,
+      fileName: safeName,
+      fileSize,
       mimeType,
-      chatId,
+      storageType: 'telegram',
       categoryId,
-      storageType
-    ).run();
+      chatId,
+      isChunked: true,
+      chunkCount: chunks.length,
+      uploadId: validUploadId
+    }, config);
+
+    await config.database.prepare(`
+      UPDATE file_chunks
+      SET file_id = ?
+      WHERE upload_id = ? AND chat_id = ?
+    `).bind(fileRowId, validUploadId, chatId).run();
+
+    return await config.database.prepare(
+      'SELECT * FROM files WHERE id = ?'
+    ).bind(fileRowId).first();
+  } catch (error) {
+    await deleteTelegramStorageMessage(manifestUpload.messageId, config);
+    if (fileRowId) {
+      await config.database.prepare('DELETE FROM files WHERE id = ?').bind(fileRowId).run();
+    }
+    throw error;
+  }
+}
+
+async function saveTelegramFileFromBlob({
+  blob,
+  fileName,
+  fileSize,
+  mimeType,
+  categoryId,
+  chatId,
+  key
+}, config) {
+  const finalKey = key || generateSafeKey(fileName);
+  const finalUrl = `https://${config.domain}/${finalKey}`;
+
+  if (!shouldUseTelegramChunks(fileSize, config)) {
+    const uploaded = await uploadSingleFileToTelegram(blob, fileName, mimeType, config);
+    await insertFileRecord({
+      url: finalUrl,
+      fileId: uploaded.fileId,
+      messageId: uploaded.messageId,
+      fileName,
+      fileSize,
+      mimeType,
+      storageType: 'telegram',
+      categoryId,
+      chatId,
+      isChunked: false,
+      chunkCount: 0
+    }, config);
+    return { url: finalUrl, isChunked: false, chunkCount: 0 };
+  }
+
+  const uploadId = crypto.randomUUID().replace(/-/g, '_');
+  const chunkSize = getTelegramChunkSizeBytes(config);
+  const totalChunks = Math.ceil(Number(fileSize) / chunkSize);
+  try {
+    for (let index = 0; index < totalChunks; index++) {
+      const start = index * chunkSize;
+      const end = Math.min(start + chunkSize, Number(fileSize));
+      await uploadOneTelegramChunk(
+        blob.slice(start, end),
+        uploadId,
+        index,
+        totalChunks,
+        fileName,
+        chatId,
+        config
+      );
+    }
+
+    const file = await finalizeChunkedTelegramUpload({
+      uploadId,
+      chatId,
+      fileName,
+      fileSize,
+      mimeType,
+      categoryId,
+      key: finalKey,
+      totalChunks
+    }, config);
+    return { url: file.url, isChunked: true, chunkCount: totalChunks };
+  } catch (error) {
+    await abortPendingChunkUpload(uploadId, chatId, config);
+    throw error;
+  }
+}
+
+async function getTelegramFileResponse(fileId, config, rangeStart = null, rangeEnd = null) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const infoResponse = await fetch(
+        `https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${encodeURIComponent(fileId)}`
+      );
+      const info = await infoResponse.json();
+      if (!infoResponse.ok || !info.ok || !info.result || !info.result.file_path) {
+        throw new Error(info.description || `getFile HTTP ${infoResponse.status}`);
+      }
+      const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${info.result.file_path}`;
+      const headers = new Headers();
+      if (rangeStart !== null && rangeEnd !== null) {
+        headers.set('Range', `bytes=${rangeStart}-${rangeEnd}`);
+      }
+      const fileResponse = await fetch(telegramUrl, { headers });
+      if (!fileResponse.ok && fileResponse.status !== 206) {
+        throw new Error(`文件下载 HTTP ${fileResponse.status}`);
+      }
+      return fileResponse;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) {
+        await new Promise(resolve => setTimeout(resolve, 300 * attempt));
+      }
+    }
+  }
+  throw lastError || new Error('Telegram 文件下载失败');
+}
+
+function parseByteRange(rangeHeader, totalSize) {
+  if (!rangeHeader) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(String(rangeHeader).trim());
+  if (!match) return { invalid: true };
+  let start;
+  let end;
+  if (match[1] === '' && match[2] !== '') {
+    const suffixLength = Number(match[2]);
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0) return { invalid: true };
+    start = Math.max(0, totalSize - suffixLength);
+    end = totalSize - 1;
+  } else {
+    start = Number(match[1]);
+    end = match[2] === '' ? totalSize - 1 : Number(match[2]);
+  }
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || start >= totalSize) {
+    return { invalid: true };
+  }
+  return { start, end: Math.min(end, totalSize - 1) };
+}
+
+async function loadChunkRows(file, config) {
+  const result = await config.database.prepare(`
+    SELECT chunk_index, telegram_file_id, message_id, chunk_size
+    FROM file_chunks
+    WHERE file_id = ?
+    ORDER BY chunk_index ASC
+  `).bind(file.id).all();
+  const chunks = result.results || [];
+  if (chunks.length) return chunks;
+
+  // 兼容/恢复 tgNetDisc 风格的 fileAll.txt 清单。
+  const manifestResponse = await getTelegramFileResponse(file.fileId, config);
+  const manifestText = await manifestResponse.text();
+  const lines = manifestText.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (lines[0] !== TELEGRAM_MANIFEST_MAGIC || lines.length < 4) {
+    throw new Error('分片清单无效，且数据库中没有分片记录');
+  }
+  let startLine = 2;
+  if (lines[startLine] && lines[startLine].startsWith('size')) startLine++;
+  const ids = lines.slice(startLine);
+  const defaultChunkSize = getTelegramChunkSizeBytes(config);
+  const totalSize = Number(file.file_size || 0);
+  return ids.map((telegramFileId, index) => ({
+    chunk_index: index,
+    telegram_file_id: telegramFileId,
+    message_id: 0,
+    chunk_size: index === ids.length - 1
+      ? Math.max(0, totalSize - defaultChunkSize * (ids.length - 1))
+      : defaultChunkSize
+  }));
+}
+
+function buildChunkSelections(chunks, rangeStart, rangeEnd) {
+  const selections = [];
+  let offset = 0;
+  for (const chunk of chunks) {
+    const size = Number(chunk.chunk_size || 0);
+    const chunkStart = offset;
+    const chunkEnd = offset + size - 1;
+    offset += size;
+    if (chunkEnd < rangeStart || chunkStart > rangeEnd) continue;
+    selections.push({
+      ...chunk,
+      localStart: Math.max(0, rangeStart - chunkStart),
+      localEnd: Math.min(size - 1, rangeEnd - chunkStart),
+      fullChunk: rangeStart <= chunkStart && rangeEnd >= chunkEnd
+    });
+  }
+  return selections;
+}
+
+function createTelegramChunkStream(selections, config) {
+  let selectionIndex = 0;
+  let currentReader = null;
+
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        while (true) {
+          if (currentReader) {
+            const { done, value } = await currentReader.read();
+            if (!done) {
+              controller.enqueue(value);
+              return;
+            }
+            currentReader = null;
+            selectionIndex++;
+          }
+
+          if (selectionIndex >= selections.length) {
+            controller.close();
+            return;
+          }
+
+          const selected = selections[selectionIndex];
+          const response = await getTelegramFileResponse(
+            selected.telegram_file_id,
+            config,
+            selected.fullChunk ? null : selected.localStart,
+            selected.fullChunk ? null : selected.localEnd
+          );
+
+          if (!selected.fullChunk && response.status !== 206) {
+            // Telegram 若忽略 Range，单片最多 19MB，可安全回退为内存切片。
+            const buffer = await response.arrayBuffer();
+            const sliced = buffer.slice(selected.localStart, selected.localEnd + 1);
+            controller.enqueue(new Uint8Array(sliced));
+            selectionIndex++;
+            return;
+          }
+
+          if (!response.body) throw new Error('Telegram 返回了空响应体');
+          currentReader = response.body.getReader();
+        }
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      if (currentReader) {
+        try { await currentReader.cancel(reason); } catch (_) {}
+      }
+    }
+  });
+}
+
+function encodeContentDispositionFileName(fileName) {
+  return encodeURIComponent(String(fileName || 'download.bin'))
+    .replace(/[!'()*]/g, character =>
+      '%' + character.charCodeAt(0).toString(16).toUpperCase()
+    );
+}
+
+async function deleteStoredFileRecord(file, config) {
+  if (!file) throw new Error('文件不存在');
+
+  if (file.storage_type === 'telegram') {
+    if (Number(file.is_chunked || 0) === 1) {
+      const result = await config.database.prepare(`
+        SELECT message_id FROM file_chunks
+        WHERE file_id = ? ORDER BY chunk_index ASC
+      `).bind(file.id).all();
+      for (const chunk of (result.results || [])) {
+        await deleteTelegramStorageMessage(chunk.message_id, config);
+      }
+      await config.database.prepare('DELETE FROM file_chunks WHERE file_id = ?').bind(file.id).run();
+    }
+    await deleteTelegramStorageMessage(file.message_id, config);
+  } else if (file.storage_type === 'r2' && config.bucket && file.fileId) {
+    await config.bucket.delete(file.fileId);
+  }
+
+  await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
+  const path = file.url ? String(file.url).split('/').pop() : '';
+  if (path && config.fileCache) config.fileCache.delete(`file:${path}`);
+  return true;
+}
+
+async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
+  const processingMessage = await sendMessage(
+    chatId,
+    '⏳ 正在处理您的文件，请稍候...',
+    config.tgBotToken
+  );
+  const processingMessageId = processingMessage && processingMessage.result
+    ? processingMessage.result.message_id
+    : null;
+
+  try {
+    const declaredSize = Number(file.file_size || 0);
+    const botDownloadLimit = Number(config.telegramDownloadLimitMB || 20) * 1024 * 1024;
+    if (declaredSize > botDownloadLimit) {
+      throw new Error(
+        `Telegram 云端 Bot API 只能通过 getFile 下载不超过 ${config.telegramDownloadLimitMB}MB 的文件。` +
+        '请改用网页上传，大文件会自动分片。'
+      );
+    }
+    if (declaredSize > Number(config.maxSizeMB) * 1024 * 1024) {
+      throw new Error(`文件超过${config.maxSizeMB}MB限制`);
+    }
+
+    const fileInfoResponse = await fetch(
+      `https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${encodeURIComponent(file.file_id)}`
+    );
+    const data = await fileInfoResponse.json();
+    if (!fileInfoResponse.ok || !data.ok || !data.result || !data.result.file_path) {
+      throw new Error(`获取文件路径失败: ${data.description || JSON.stringify(data)}`);
+    }
+
+    const actualSize = Number(data.result.file_size || declaredSize || 0);
+    if (actualSize > botDownloadLimit) {
+      throw new Error(
+        `文件为 ${formatSize(actualSize)}，超过 Telegram Bot API 的 ${config.telegramDownloadLimitMB}MB 下载限制。` +
+        '请使用网页分片上传。'
+      );
+    }
+    if (actualSize > Number(config.maxSizeMB) * 1024 * 1024) {
+      throw new Error(`文件超过${config.maxSizeMB}MB限制`);
+    }
+
     if (processingMessageId) {
-      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
+      fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: chatId,
-          message_id: processingMessageId
+          message_id: processingMessageId,
+          text: '⏳ 文件已接收，正在写入存储...'
         })
-      }).catch(err => console.error('删除处理消息失败:', err));
+      }).catch(error => console.error('更新处理消息失败:', error));
     }
+
+    let categoryId = userSetting && userSetting.current_category_id
+      ? userSetting.current_category_id
+      : null;
+    if (!categoryId) {
+      let defaultCategory = await config.database.prepare(
+        'SELECT id FROM categories WHERE name = ?'
+      ).bind('默认分类').first();
+      if (!defaultCategory) {
+        const result = await config.database.prepare(
+          'INSERT INTO categories (name, created_at) VALUES (?, ?)'
+        ).bind('默认分类', Date.now()).run();
+        defaultCategory = { id: result.meta && result.meta.last_row_id };
+      }
+      categoryId = defaultCategory && defaultCategory.id;
+    }
+
+    const filePath = data.result.file_path;
+    const fileUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${filePath}`;
+    const fileResponse = await fetch(fileUrl);
+    if (!fileResponse.ok) {
+      throw new Error(`获取文件内容失败: ${fileResponse.status} ${fileResponse.statusText}`);
+    }
+
+    let mimeType = file.mime_type || fileResponse.headers.get('content-type') || 'application/octet-stream';
+    const filePathExt = (filePath.split('.').pop() || '').toLowerCase();
+    let fileName = file.file_name || '';
+    let ext = fileName.includes('.')
+      ? (fileName.split('.').pop() || '').toLowerCase()
+      : filePathExt;
+    if (!ext) ext = getExtensionFromMime(mimeType);
+    if (!fileName) fileName = `file_${Date.now()}.${ext || 'bin'}`;
+    if (!mimeType || mimeType === 'application/octet-stream') {
+      mimeType = getContentType(ext || 'bin');
+    }
+
+    const blob = new Blob([await fileResponse.arrayBuffer()], { type: mimeType });
+    const storageType = userSetting && userSetting.storage_type
+      ? userSetting.storage_type
+      : 'telegram';
+    const key = generateSafeKey(fileName);
+    let finalUrl;
+
+    if (storageType === 'r2' && config.bucket) {
+      await config.bucket.put(key, blob, { httpMetadata: { contentType: mimeType } });
+      finalUrl = `https://${config.domain}/${key}`;
+      await insertFileRecord({
+        url: finalUrl,
+        fileId: key,
+        messageId: -1,
+        fileName,
+        fileSize: actualSize || blob.size,
+        mimeType,
+        storageType: 'r2',
+        categoryId,
+        chatId,
+        isChunked: false
+      }, config);
+    } else {
+      const saved = await saveTelegramFileFromBlob({
+        blob,
+        fileName,
+        fileSize: actualSize || blob.size,
+        mimeType,
+        categoryId,
+        chatId,
+        key
+      }, config);
+      finalUrl = saved.url;
+    }
+
+    if (processingMessageId) {
+      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, message_id: processingMessageId })
+      }).catch(error => console.error('删除处理消息失败:', error));
+    }
+
     const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(finalUrl)}`;
     await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendPhoto`, {
       method: 'POST',
@@ -2735,21 +3345,17 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       body: JSON.stringify({
         chat_id: chatId,
         photo: qrCodeUrl,
-        caption: `✅ 文件上传成功\n\n📝 图床直链：\n${finalUrl}\n\n🔍 扫描上方二维码快速访问`,
-        parse_mode: 'HTML'
+        caption: `✅ 文件上传成功\n\n📝 图床直链：\n${finalUrl}\n\n🔍 扫描上方二维码快速访问`
       })
     });
   } catch (error) {
-    console.error("Error handling media upload:", error);
+    console.error('Error handling media upload:', error);
     if (processingMessageId) {
       await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          message_id: processingMessageId
-        })
-      }).catch(err => console.error('删除处理消息失败:', err));
+        body: JSON.stringify({ chat_id: chatId, message_id: processingMessageId })
+      }).catch(deleteError => console.error('删除处理消息失败:', deleteError));
     }
     await sendMessage(chatId, `❌ 上传失败: ${error.message}`, config.tgBotToken);
   }
@@ -2944,170 +3550,288 @@ async function handleDeleteCategoryRequest(request, config) {
   }
 }
 async function handleUploadRequest(request, config) {
-  if (
-    config.enableAuth &&
-    !authenticate(request, config)
-  ) {
-    return Response.redirect(
-      `${new URL(request.url).origin}/`,
-      302
-    );
+  if (config.enableAuth && !authenticate(request, config)) {
+    return Response.redirect(`${new URL(request.url).origin}/`, 302);
   }
 
   const chatId = getWebOwnerChatId(config);
-
   if (!chatId) {
-    return new Response(
-      '未配置 TG_ADMIN_ID，网页上传无法确定文件归属用户',
-      {
-        status: 500,
-        headers: {
-          'Content-Type': 'text/plain;charset=UTF-8',
-          'Cache-Control': 'no-store'
-        }
-      }
-    );
+    return new Response('未配置 TG_ADMIN_ID，网页上传无法确定文件归属用户', {
+      status: 500,
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Cache-Control': 'no-store' }
+    });
   }
+
   if (request.method === 'GET') {
     const categories = await config.database.prepare('SELECT id, name FROM categories').all();
     const categoryOptions = categories.results.length
-      ? categories.results.map(c => `<option value="${c.id}">${c.name}</option>`).join('')
+      ? categories.results.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('')
       : '<option value="">暂无分类</option>';
-    let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
+    let userSetting = await config.database.prepare(
+      'SELECT * FROM user_settings WHERE chat_id = ?'
+    ).bind(chatId).first();
     if (!userSetting) {
-      const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
-      await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type, current_category_id) VALUES (?, ?, ?)')
-        .bind(chatId, 'telegram', defaultCategory.id).run();
-      userSetting = { storage_type: 'telegram', current_category_id: defaultCategory.id };
+      const defaultCategory = await config.database.prepare(
+        'SELECT id FROM categories WHERE name = ?'
+      ).bind('默认分类').first();
+      await config.database.prepare(`
+        INSERT INTO user_settings (chat_id, storage_type, current_category_id)
+        VALUES (?, ?, ?)
+      `).bind(chatId, 'telegram', defaultCategory && defaultCategory.id).run();
+      userSetting = {
+        storage_type: 'telegram',
+        current_category_id: defaultCategory && defaultCategory.id
+      };
     }
-    const html = generateUploadPage(categoryOptions, userSetting.storage_type);
-    return new Response(html, {
+    return new Response(generateUploadPage(categoryOptions, userSetting.storage_type), {
       headers: { 'Content-Type': 'text/html;charset=UTF-8' }
     });
   }
+
   try {
     const formData = await request.formData();
     const file = formData.get('file');
     const categoryId = formData.get('category');
-    const storageType = formData.get('storage_type');
-    if (!file) throw new Error('未找到文件');
-    if (file.size > config.maxSizeMB * 1024 * 1024) throw new Error(`文件超过${config.maxSizeMB}MB限制`);
-    let defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
-    if (!defaultCategory) {
-      try {
-        console.log('默认分类不存在，正在创建...');
-        const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
-          .bind('默认分类', Date.now()).run();
-        const newDefaultId = result.meta && result.meta.last_row_id;
-        if (newDefaultId) {
-          defaultCategory = { id: newDefaultId };
-          console.log(`已创建新的默认分类，ID: ${newDefaultId}`);
-        }
-      } catch (error) {
-        console.error('创建默认分类失败:', error);
-        defaultCategory = { id: categoryId || null };
-      }
+    const storageType = formData.get('storage_type') === 'r2' ? 'r2' : 'telegram';
+    if (!file || typeof file.slice !== 'function') throw new Error('未找到文件');
+    if (Number(file.size) > Number(config.maxSizeMB) * 1024 * 1024) {
+      throw new Error(`文件超过${config.maxSizeMB}MB限制`);
     }
-    const finalCategoryId = categoryId || (defaultCategory ? defaultCategory.id : null);
-    await config.database.prepare('UPDATE user_settings SET storage_type = ?, current_category_id = ? WHERE chat_id = ?')
-      .bind(storageType, finalCategoryId, chatId).run();
 
-    // 原始扩展名（仅用于判断 MIME 类型 / Telegram 上传方法，不再直接拼进 URL）
+    let defaultCategory = await config.database.prepare(
+      'SELECT id FROM categories WHERE name = ?'
+    ).bind('默认分类').first();
+    if (!defaultCategory) {
+      const result = await config.database.prepare(
+        'INSERT INTO categories (name, created_at) VALUES (?, ?)'
+      ).bind('默认分类', Date.now()).run();
+      defaultCategory = { id: result.meta && result.meta.last_row_id };
+    }
+    const finalCategoryId = categoryId || (defaultCategory && defaultCategory.id) || null;
+    await config.database.prepare(`
+      UPDATE user_settings
+      SET storage_type = ?, current_category_id = ?
+      WHERE chat_id = ?
+    `).bind(storageType, finalCategoryId, chatId).run();
+
     const rawExt = (file.name.split('.').pop() || '').toLowerCase();
     const mimeType = file.type || getContentType(rawExt);
-    const [mainType] = mimeType.split('/');
-    const typeMap = {
-      image: { method: 'sendPhoto', field: 'photo' },
-      video: { method: 'sendVideo', field: 'video' },
-      audio: { method: 'sendAudio', field: 'audio' }
-    };
-    let { method = 'sendDocument', field = 'document' } = typeMap[mainType] || {};
-    if (['application', 'text'].includes(mainType)) {
-      method = 'sendDocument';
-      field = 'document';
-    }
-
-    // 统一在这里生成一次 key，全程复用，避免存储路径与数据库URL不一致
     const key = generateSafeKey(file.name);
-    const finalUrl = `https://${config.domain}/${key}`;
-
-    let dbFileId, dbMessageId;
+    let finalUrl;
+    let chunked = false;
+    let chunkCount = 0;
 
     if (storageType === 'r2') {
       if (!config.bucket) throw new Error('未配置R2存储桶(BUCKET)，无法使用R2存储');
-      await config.bucket.put(key, await file.arrayBuffer(), { httpMetadata: { contentType: mimeType } });
-      dbFileId = key;
-      dbMessageId = -1;
+      await config.bucket.put(key, await file.arrayBuffer(), {
+        httpMetadata: { contentType: mimeType }
+      });
+      finalUrl = `https://${config.domain}/${key}`;
+      await insertFileRecord({
+        url: finalUrl,
+        fileId: key,
+        messageId: -1,
+        fileName: file.name,
+        fileSize: file.size,
+        mimeType,
+        storageType: 'r2',
+        categoryId: finalCategoryId,
+        chatId,
+        isChunked: false
+      }, config);
     } else {
-      if (!config.tgStorageChatId) {
-        throw new Error(
-          '未配置 TG_STORAGE_CHAT_ID，无法使用 Telegram 存储'
-        );
-      }
-    
-      const tgFormData = new FormData();
-      tgFormData.append(
-        'chat_id',
-        config.tgStorageChatId
-      );
-      tgFormData.append(field, file, file.name);
-      const tgResponse = await fetch(
-        `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
-        { method: 'POST', body: tgFormData }
-      );
-      if (!tgResponse.ok) throw new Error('Telegram参数配置错误');
-      const tgData = await tgResponse.json();
-      const result = tgData.result;
-      const messageId = result.message_id;
-      const fileId = result.document?.file_id ||
-                     result.video?.file_id ||
-                     result.audio?.file_id ||
-                     (result.photo && result.photo[result.photo.length - 1]?.file_id);
-      if (!fileId) throw new Error('未获取到文件ID');
-      if (!messageId) throw new Error('未获取到tg消息ID');
-      dbFileId = fileId;
-      dbMessageId = messageId;
+      const saved = await saveTelegramFileFromBlob({
+        blob: file,
+        fileName: file.name,
+        fileSize: file.size,
+        mimeType,
+        categoryId: finalCategoryId,
+        chatId,
+        key
+      }, config);
+      finalUrl = saved.url;
+      chunked = saved.isChunked;
+      chunkCount = saved.chunkCount;
     }
 
-    const time = Date.now();
-    const timestamp = new Date(time + 8 * 60 * 60 * 1000).toISOString();
-    
-    await config.database.prepare(`
-      INSERT INTO files (url, fileId, message_id, created_at, file_name, file_size, mime_type, storage_type, category_id, chat_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      finalUrl,
-      dbFileId,
-      dbMessageId,
-      timestamp,
-      file.name,
-      file.size,
-      mimeType,
-      storageType,
-      finalCategoryId,
-      chatId
-    ).run();
-
-    return new Response(
-      JSON.stringify({ status: 1, msg: "✔ 上传成功", url: finalUrl }),
-      { headers: { 'Content-Type': 'application/json' } }
-    );
+    return new Response(JSON.stringify({
+      status: 1,
+      msg: chunked ? `✔ 分片上传成功（${chunkCount}片）` : '✔ 上传成功',
+      url: finalUrl,
+      chunked,
+      chunk_count: chunkCount
+    }), {
+      headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+    });
   } catch (error) {
     console.error(`[Upload Error] ${error.message}`);
     let statusCode = 500;
-    if (error.message.includes(`文件超过${config.maxSizeMB}MB限制`)) {
-      statusCode = 400;
-    } else if (error.message.includes('Telegram参数配置错误')) {
-      statusCode = 502;
-    } else if (error.message.includes('未获取到文件ID') || error.message.includes('未获取到tg消息ID')) {
-      statusCode = 500;
-    } else if (error instanceof TypeError && error.message.includes('Failed to fetch')) {
-      statusCode = 504;
+    if (error.message.includes('文件超过')) statusCode = 400;
+    else if (error.message.includes('Telegram')) statusCode = 502;
+    else if (error instanceof TypeError && error.message.includes('Failed to fetch')) statusCode = 504;
+    return new Response(JSON.stringify({
+      status: 0,
+      msg: '✘ 上传失败',
+      error: error.message
+    }), {
+      status: statusCode,
+      headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+    });
+  }
+}
+
+async function handleUploadChunkRequest(request, config) {
+  if (request.method !== 'POST') {
+    return new Response(JSON.stringify({ status: 0, error: '只支持 POST' }), {
+      status: 405,
+      headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+    });
+  }
+  const chatId = getWebOwnerChatId(config);
+  if (!chatId) throw new Error('未配置 TG_ADMIN_ID');
+
+  try {
+    const formData = await request.formData();
+    const uploadId = normalizeUploadId(formData.get('upload_id'));
+    const chunk = formData.get('chunk');
+    const chunkIndex = Number(formData.get('chunk_index'));
+    const totalChunks = Number(formData.get('total_chunks'));
+    const fileName = String(formData.get('file_name') || 'large-file.bin');
+    const fileSize = Number(formData.get('file_size') || 0);
+
+    if (!uploadId) throw new Error('upload_id 格式无效');
+    if (!chunk || typeof chunk.slice !== 'function') throw new Error('缺少分片数据');
+    if (!Number.isInteger(chunkIndex) || chunkIndex < 0) throw new Error('chunk_index 无效');
+    if (!Number.isInteger(totalChunks) || totalChunks <= 1 || chunkIndex >= totalChunks) {
+      throw new Error('total_chunks 无效');
     }
-    return new Response(
-      JSON.stringify({ status: 0, msg: "✘ 上传失败", error: error.message }),
-      { status: statusCode, headers: { 'Content-Type': 'application/json' } }
+    if (fileSize <= 0 || fileSize > Number(config.maxSizeMB) * 1024 * 1024) {
+      throw new Error(`文件超过${config.maxSizeMB}MB限制或大小无效`);
+    }
+    const maxChunkSize = getTelegramChunkSizeBytes(config);
+    if (Number(chunk.size) <= 0 || Number(chunk.size) > maxChunkSize) {
+      throw new Error(`单个分片必须大于0且不超过${config.telegramChunkSizeMB}MB`);
+    }
+    if (totalChunks !== Math.ceil(fileSize / maxChunkSize)) {
+      throw new Error('total_chunks 与文件大小不匹配');
+    }
+
+    const saved = await uploadOneTelegramChunk(
+      chunk,
+      uploadId,
+      chunkIndex,
+      totalChunks,
+      fileName,
+      chatId,
+      config
     );
+
+    return new Response(JSON.stringify({
+      status: 1,
+      chunk_index: chunkIndex,
+      chunk_size: Number(saved.chunk_size || chunk.size)
+    }), {
+      headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+    });
+  } catch (error) {
+    console.error('[Chunk Upload Error]', error);
+    return new Response(JSON.stringify({ status: 0, error: error.message }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+    });
+  }
+}
+
+async function handleUploadCompleteRequest(request, config) {
+  if (request.method !== 'POST') {
+    return new Response(JSON.stringify({ status: 0, error: '只支持 POST' }), {
+      status: 405,
+      headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+    });
+  }
+  const chatId = getWebOwnerChatId(config);
+  try {
+    if (!chatId) throw new Error('未配置 TG_ADMIN_ID');
+    const body = await request.json();
+    const uploadId = normalizeUploadId(body.upload_id);
+    const fileName = sanitizeTelegramFileName(body.file_name, 'large-file.bin');
+    const fileSize = Number(body.file_size || 0);
+    const mimeType = String(body.mime_type || 'application/octet-stream');
+    const totalChunks = Number(body.total_chunks || 0);
+    let categoryId = body.category || null;
+    const key = body.key ? String(body.key) : generateSafeKey(fileName);
+
+    if (!uploadId) throw new Error('upload_id 格式无效');
+    if (!Number.isInteger(totalChunks) || totalChunks <= 1) throw new Error('total_chunks 无效');
+    if (fileSize <= 0 || fileSize > Number(config.maxSizeMB) * 1024 * 1024) {
+      throw new Error(`文件超过${config.maxSizeMB}MB限制或大小无效`);
+    }
+    const expectedChunks = Math.ceil(fileSize / getTelegramChunkSizeBytes(config));
+    if (totalChunks !== expectedChunks) {
+      throw new Error(`total_chunks 不匹配：应为 ${expectedChunks}`);
+    }
+    if (!categoryId) {
+      const defaultCategory = await config.database.prepare(
+        'SELECT id FROM categories WHERE name = ? LIMIT 1'
+      ).bind('默认分类').first();
+      categoryId = defaultCategory && defaultCategory.id;
+    }
+
+    await config.database.prepare(`
+      UPDATE user_settings
+      SET storage_type = 'telegram', current_category_id = ?
+      WHERE chat_id = ?
+    `).bind(categoryId || null, chatId).run();
+
+    const file = await finalizeChunkedTelegramUpload({
+      uploadId,
+      chatId,
+      fileName,
+      fileSize,
+      mimeType,
+      categoryId,
+      key,
+      totalChunks
+    }, config);
+
+    return new Response(JSON.stringify({
+      status: 1,
+      msg: `✔ 分片上传成功（${totalChunks}片）`,
+      url: file.url,
+      chunked: true,
+      chunk_count: totalChunks
+    }), {
+      headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+    });
+  } catch (error) {
+    console.error('[Chunk Complete Error]', error);
+    return new Response(JSON.stringify({ status: 0, error: error.message }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+    });
+  }
+}
+
+async function handleUploadAbortRequest(request, config) {
+  if (request.method !== 'POST') {
+    return new Response(JSON.stringify({ status: 0, error: '只支持 POST' }), {
+      status: 405,
+      headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+    });
+  }
+  const chatId = getWebOwnerChatId(config);
+  try {
+    if (!chatId) throw new Error('未配置 TG_ADMIN_ID');
+    const body = await request.json();
+    const deleted = await abortPendingChunkUpload(body.upload_id, chatId, config);
+    return new Response(JSON.stringify({ status: 1, deleted }), {
+      headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ status: 0, error: error.message }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+    });
   }
 }
 async function handleDeleteMultipleRequest(request, config) {
@@ -3117,81 +3841,51 @@ async function handleDeleteMultipleRequest(request, config) {
   try {
     const { urls } = await request.json();
     if (!Array.isArray(urls) || urls.length === 0) {
-      return new Response(JSON.stringify({ 
-        status: 0, 
-        error: '无效的URL列表' 
-      }), {
+      return new Response(JSON.stringify({ status: 0, error: '无效的URL列表' }), {
         status: 400,
         headers: { 'Content-Type': 'application/json' }
       });
     }
-    const results = {
-      success: [],
-      failed: []
-    };
+
+    const results = { success: [], failed: [] };
     for (const url of urls) {
       try {
-        const fileName = url.split('/').pop();
+        const fileName = String(url).split('/').pop();
         let file = await config.database.prepare(
-          'SELECT id, fileId, message_id, storage_type FROM files WHERE url = ?'
+          'SELECT * FROM files WHERE url = ?'
         ).bind(url).first();
         if (!file && fileName) {
           file = await config.database.prepare(
-            'SELECT id, fileId, message_id, storage_type FROM files WHERE fileId = ?'
-          ).bind(fileName).first();
+            'SELECT * FROM files WHERE fileId = ? OR url LIKE ? ORDER BY id DESC LIMIT 1'
+          ).bind(fileName, `%/${fileName}`).first();
         }
-        if (file) {
-          console.log(`正在删除文件: ${url}, 存储类型: ${file.storage_type}`);
-          if (file.storage_type === 'telegram' && file.message_id) {
-            try {
-              await fetch(
-                `https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${file.message_id}`
-              );
-              console.log(`已从Telegram删除消息: ${file.message_id}`);
-            } catch (error) {
-              console.error(`从Telegram删除消息失败: ${error.message}`);
-            }
-          } else if (file.storage_type === 'r2' && file.fileId && config.bucket) {
-            try {
-              await config.bucket.delete(file.fileId);
-              console.log(`已从R2删除文件: ${file.fileId}`);
-            } catch (error) {
-              console.error(`从R2删除文件失败: ${error.message}`);
-            }
-          }
-          await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
-          console.log(`已从数据库删除记录: ID=${file.id}`);
-          results.success.push(url);
-        } else {
-          console.log(`未找到文件记录: ${url}`);
-          results.failed.push({url, reason: '未找到文件记录'});
+        if (!file) {
+          results.failed.push({ url, reason: '未找到文件记录' });
+          continue;
         }
+        await deleteStoredFileRecord(file, config);
+        results.success.push(url);
       } catch (error) {
-        console.error(`删除文件失败 ${url}: ${error.message}`);
-        results.failed.push({url, reason: error.message});
+        results.failed.push({ url, reason: error.message });
       }
     }
-    return new Response(
-      JSON.stringify({ 
-        status: 1, 
-        message: '批量删除处理完成',
-        results: {
-          success: results.success.length,
-          failed: results.failed.length,
-          details: results
-        }
-      }),
-      { headers: { 'Content-Type': 'application/json' } }
-    );
+
+    return new Response(JSON.stringify({
+      status: 1,
+      message: '批量删除处理完成',
+      results: {
+        success: results.success.length,
+        failed: results.failed.length,
+        details: results
+      }
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
   } catch (error) {
-    console.error(`[Delete Multiple Error] ${error.message}`);
-    return new Response(
-      JSON.stringify({ 
-        status: 0, 
-        error: error.message 
-      }),
-      { status: 500, headers: { 'Content-Type': 'application/json' } }
-    );
+    return new Response(JSON.stringify({ status: 0, error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 }
 function createApiJsonResponse(data, status = 200) {
@@ -3476,117 +4170,138 @@ async function handleFileRequest(request, config) {
   try {
     const url = new URL(request.url);
     const path = decodeURIComponent(url.pathname.slice(1));
-    if (!path) {
-      return new Response('Not Found', { status: 404 });
-    }
+    if (!path) return new Response('Not Found', { status: 404 });
+
+    const rangeHeader = request.headers.get('Range');
     const cacheKey = `file:${path}`;
-    if (config.fileCache && config.fileCache.has(cacheKey)) {
+    if (!rangeHeader && request.method !== 'HEAD' && config.fileCache && config.fileCache.has(cacheKey)) {
       const cachedData = config.fileCache.get(cacheKey);
       if (Date.now() - cachedData.timestamp < config.fileCacheTTL) {
-        console.log(`从缓存提供文件: ${path}`);
         return cachedData.response.clone();
-      } else {
-        config.fileCache.delete(cacheKey);
       }
+      config.fileCache.delete(cacheKey);
     }
-    const cacheAndReturnResponse = (response) => {
-      if (config.fileCache) {
-        config.fileCache.set(cacheKey, {
-          response: response.clone(),
-          timestamp: Date.now()
-        });
+
+    const cacheAndReturnResponse = (response, allowCache = true) => {
+      if (allowCache && !rangeHeader && request.method !== 'HEAD' && config.fileCache) {
+        config.fileCache.set(cacheKey, { response: response.clone(), timestamp: Date.now() });
       }
       return response;
     };
-    const getCommonHeaders = (contentType) => {
-      const headers = new Headers();
-      headers.set('Content-Type', contentType);
-      headers.set('Access-Control-Allow-Origin', '*');
-      if (contentType.startsWith('image/') || 
-          contentType.startsWith('video/') || 
-          contentType.startsWith('audio/')) {
-        headers.set('Content-Disposition', 'inline');
-      }
-      headers.set('Cache-Control', 'public, max-age=31536000');
-      return headers;
-    };
+
+    // R2 原始 key 优先。
     if (config.bucket) {
       try {
         const object = await config.bucket.get(path);
         if (object) {
           const contentType = object.httpMetadata.contentType || getContentType(path.split('.').pop());
-          const headers = getCommonHeaders(contentType);
+          const headers = new Headers();
           object.writeHttpMetadata(headers);
+          headers.set('Content-Type', contentType);
+          headers.set('Access-Control-Allow-Origin', '*');
+          headers.set('Cache-Control', 'public, max-age=31536000');
           headers.set('etag', object.httpEtag);
-          return cacheAndReturnResponse(new Response(object.body, { headers }));
+          return cacheAndReturnResponse(new Response(
+            request.method === 'HEAD' ? null : object.body,
+            { headers }
+          ));
         }
       } catch (error) {
-        if (error.name !== 'NoSuchKey') {
-          console.error('R2获取文件错误:', error.name);
-        }
+        if (error.name !== 'NoSuchKey') console.error('R2获取文件错误:', error);
       }
     }
-    let file;
+
     const urlPattern = `https://${config.domain}/${path}`;
-    file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(urlPattern).first();
+    let file = await config.database.prepare(
+      'SELECT * FROM files WHERE url = ?'
+    ).bind(urlPattern).first();
     if (!file) {
-      file = await config.database.prepare('SELECT * FROM files WHERE fileId = ?').bind(path).first();
+      file = await config.database.prepare(
+        'SELECT * FROM files WHERE fileId = ?'
+      ).bind(path).first();
     }
     if (!file) {
       const fileName = path.split('/').pop();
-      file = await config.database.prepare('SELECT * FROM files WHERE file_name = ?').bind(fileName).first();
+      file = await config.database.prepare(
+        'SELECT * FROM files WHERE file_name = ? ORDER BY id DESC LIMIT 1'
+      ).bind(fileName).first();
     }
-    if (!file) {
-      return new Response('File not found', { status: 404 });
+    if (!file) return new Response('File not found', { status: 404 });
+
+    const contentType = file.mime_type || getContentType(path.split('.').pop());
+    const totalSize = Number(file.file_size || 0);
+    const fileName = file.file_name || path.split('/').pop() || 'download.bin';
+    const inline = contentType.startsWith('image/') || contentType.startsWith('video/') || contentType.startsWith('audio/');
+    const headers = new Headers();
+    headers.set('Content-Type', contentType);
+    headers.set('Access-Control-Allow-Origin', '*');
+    headers.set('Accept-Ranges', 'bytes');
+    headers.set('Cache-Control', 'public, max-age=31536000');
+    headers.set(
+      'Content-Disposition',
+      `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeContentDispositionFileName(fileName)}`
+    );
+
+    const parsedRange = totalSize > 0 ? parseByteRange(rangeHeader, totalSize) : null;
+    if (parsedRange && parsedRange.invalid) {
+      headers.set('Content-Range', `bytes */${totalSize}`);
+      return new Response('Requested Range Not Satisfiable', { status: 416, headers });
     }
+    const rangeStart = parsedRange ? parsedRange.start : 0;
+    const rangeEnd = parsedRange ? parsedRange.end : Math.max(0, totalSize - 1);
+    if (totalSize > 0) {
+      headers.set('Content-Length', String(rangeEnd - rangeStart + 1));
+      if (parsedRange) headers.set('Content-Range', `bytes ${rangeStart}-${rangeEnd}/${totalSize}`);
+    }
+    if (request.method === 'HEAD') {
+      return new Response(null, { status: parsedRange ? 206 : 200, headers });
+    }
+
     if (file.storage_type === 'telegram') {
-      try {
-        const telegramFileId = file.fileId;
-        if (!telegramFileId) {
-          console.error('文件记录缺少Telegram fileId');
-          return new Response('Missing Telegram file ID', { status: 500 });
-        }
-        const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${telegramFileId}`);
-        const data = await response.json();
-        if (!data.ok) {
-          console.error('Telegram getFile 失败:', data.description);
-          return new Response('Failed to get file from Telegram', { status: 500 });
-        }
-        const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
-        const fileResponse = await fetch(telegramUrl);
-        if (!fileResponse.ok) {
-          console.error(`从Telegram获取文件失败: ${fileResponse.status}`);
-          return new Response('Failed to fetch file from Telegram', { status: fileResponse.status });
-        }
-        const contentType = file.mime_type || getContentType(path.split('.').pop());
-        const headers = getCommonHeaders(contentType);
-        return cacheAndReturnResponse(new Response(fileResponse.body, { headers }));
-      } catch (error) {
-        console.error('处理Telegram文件出错:', error.message);
-        return new Response('Error processing Telegram file', { status: 500 });
+      if (Number(file.is_chunked || 0) === 1) {
+        const chunks = await loadChunkRows(file, config);
+        if (!chunks.length) throw new Error('没有找到任何分片');
+        const selections = buildChunkSelections(chunks, rangeStart, rangeEnd);
+        if (!selections.length) throw new Error('请求范围没有对应分片');
+        const stream = createTelegramChunkStream(selections, config);
+        return new Response(stream, {
+          status: parsedRange ? 206 : 200,
+          headers
+        });
       }
-    } 
-    else if (file.storage_type === 'r2' && config.bucket) {
-      try {
-        const object = await config.bucket.get(file.fileId);
-        if (object) {
-          const contentType = object.httpMetadata.contentType || file.mime_type || getContentType(path.split('.').pop());
-          const headers = getCommonHeaders(contentType);
-          object.writeHttpMetadata(headers);
-          headers.set('etag', object.httpEtag);
-          return cacheAndReturnResponse(new Response(object.body, { headers }));
-        }
-      } catch (error) {
-        console.error('通过fileId从R2获取文件出错:', error.message);
+
+      if (!file.fileId) throw new Error('文件记录缺少 Telegram fileId');
+      const response = await getTelegramFileResponse(
+        file.fileId,
+        config,
+        parsedRange ? rangeStart : null,
+        parsedRange ? rangeEnd : null
+      );
+      let body = response.body;
+      if (parsedRange && response.status !== 206) {
+        const buffer = await response.arrayBuffer();
+        body = buffer.slice(rangeStart, rangeEnd + 1);
+      }
+      const output = new Response(body, {
+        status: parsedRange ? 206 : 200,
+        headers
+      });
+      return cacheAndReturnResponse(output, totalSize > 0 && totalSize <= 5 * 1024 * 1024);
+    }
+
+    if (file.storage_type === 'r2' && config.bucket) {
+      const object = await config.bucket.get(file.fileId);
+      if (object) {
+        object.writeHttpMetadata(headers);
+        return cacheAndReturnResponse(new Response(object.body, { headers }));
       }
     }
-    if (file.url && file.url !== urlPattern) {
-      return Response.redirect(file.url, 302);
-    }
+
+    if (file.url && file.url !== urlPattern) return Response.redirect(file.url, 302);
     return new Response('File not available', { status: 404 });
   } catch (error) {
-    console.error('处理文件请求出错:', error.message);
-    return new Response('Internal Server Error', { status: 500 });
+    console.error('处理文件请求出错:', error);
+    return new Response(`Internal Server Error: ${error.message}`, { status: 500 });
   }
 }
 async function handleDeleteRequest(request, config) {
@@ -3596,15 +4311,14 @@ async function handleDeleteRequest(request, config) {
   try {
     const { id, fileId } = await request.json();
     if (!id && !fileId) {
-      return new Response(JSON.stringify({
-        status: 0,
-        message: '缺少文件标识信息'
-      }), {
+      return new Response(JSON.stringify({ status: 0, message: '缺少文件标识信息' }), {
+        status: 400,
         headers: { 'Content-Type': 'application/json' }
       });
     }
-    let file;
-    if (id && id.startsWith('http')) {
+
+    let file = null;
+    if (id && String(id).startsWith('http')) {
       file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(id).first();
     } else if (id) {
       file = await config.database.prepare('SELECT * FROM files WHERE id = ?').bind(id).first();
@@ -3613,28 +4327,14 @@ async function handleDeleteRequest(request, config) {
       file = await config.database.prepare('SELECT * FROM files WHERE fileId = ?').bind(fileId).first();
     }
     if (!file) {
-      return new Response(JSON.stringify({
-        status: 0,
-        message: '文件不存在'
-      }), {
+      return new Response(JSON.stringify({ status: 0, message: '文件不存在' }), {
+        status: 404,
         headers: { 'Content-Type': 'application/json' }
       });
     }
-    console.log('准备删除文件:', {
-      fileId: file.fileId,
-      url: file.url,
-      存储类型: file.storage_type
-    });
-    if (file.storage_type === 'r2' && config.bucket) {
-      await deleteFile(file.fileId, config);
-      console.log('已从R2存储中删除文件:', file.fileId);
-    }
-    await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
-    console.log('已从数据库中删除文件记录');
-    return new Response(JSON.stringify({
-      status: 1,
-      message: '删除成功'
-    }), {
+
+    await deleteStoredFileRecord(file, config);
+    return new Response(JSON.stringify({ status: 1, message: '删除成功' }), {
       headers: { 'Content-Type': 'application/json' }
     });
   } catch (error) {
@@ -3643,6 +4343,7 @@ async function handleDeleteRequest(request, config) {
       status: 0,
       message: '删除文件失败: ' + error.message
     }), {
+      status: 500,
       headers: { 'Content-Type': 'application/json' }
     });
   }
@@ -4747,71 +5448,186 @@ function generateUploadPage(categoryOptions, storageType) {
           }
         }
       });
-      async function handleFiles(e) {
-        const response = await fetch('/config');
-        if (!response.ok) {
-          throw new Error('Failed to fetch config');
+      let runtimeConfigPromise = null;
+      function getRuntimeConfig() {
+        if (!runtimeConfigPromise) {
+          runtimeConfigPromise = fetch('/config', { cache: 'no-store' }).then(async response => {
+            if (!response.ok) throw new Error('读取上传配置失败');
+            return response.json();
+          });
         }
-        const config = await response.json();
-        const files = Array.from(e.target.files);
-        for (let file of files) {
+        return runtimeConfigPromise;
+      }
+      async function handleFiles(e) {
+        const config = await getRuntimeConfig();
+        const files = Array.from(e.target.files || []);
+        for (const file of files) {
           if (file.size > config.maxSizeMB * 1024 * 1024) {
-            showConfirmModal(\`文件超过\${config.maxSizeMB}MB限制\`, null, true);
-            return;
+            showConfirmModal('文件超过' + config.maxSizeMB + 'MB限制', null, true);
+            continue;
           }
-          await uploadFile(file);
+          await uploadFile(file, config);
         }
       }
-      function uploadFile(file) {
-        return new Promise((resolve) => {
-          const preview = createPreview(file);
-          previewArea.appendChild(preview);
+      async function uploadFile(file, runtimeConfig = null) {
+        const config = runtimeConfig || await getRuntimeConfig();
+        const preview = createPreview(file);
+        previewArea.appendChild(preview);
+        const storageType = document.querySelector('.storage-btn.active').dataset.storage;
+        try {
+          let data;
+          if (
+            storageType === 'telegram' &&
+            file.size > config.telegramChunkSizeMB * 1024 * 1024
+          ) {
+            data = await uploadFileInChunks(file, preview, config);
+          } else {
+            data = await uploadFileDirect(file, preview, storageType);
+          }
+          if (!data || data.status !== 1) {
+            throw new Error((data && (data.error || data.msg)) || '上传失败');
+          }
+          const progressTrack = preview.querySelector('.progress-track');
+          const progressText = preview.querySelector('.progress-text');
+          progressTrack.style.width = '100%';
+          progressText.textContent = data.msg || '✔ 上传成功';
+          uploadedUrls.push(data.url);
+          updateUrlArea();
+          preview.classList.add('success');
+        } catch (error) {
+          preview.querySelector('.progress-text').textContent = '✗ ' + error.message;
+          preview.classList.add('error');
+        }
+      }
+      function uploadFileDirect(file, preview, storageType) {
+        return new Promise((resolve, reject) => {
           const xhr = new XMLHttpRequest();
           const progressTrack = preview.querySelector('.progress-track');
           const progressText = preview.querySelector('.progress-text');
-      
-          xhr.upload.addEventListener('progress', (e) => {
-            if (e.lengthComputable) {
-              const percent = Math.round((e.loaded / e.total) * 100);
-              progressTrack.style.width = \`\${percent}%\`;
-              progressText.textContent = \`\${percent}%\`;
-            }
+          xhr.upload.addEventListener('progress', event => {
+            if (!event.lengthComputable) return;
+            const percent = Math.round(event.loaded / event.total * 100);
+            progressTrack.style.width = percent + '%';
+            progressText.textContent = percent + '%';
           });
-      
           xhr.addEventListener('load', () => {
             try {
               const data = JSON.parse(xhr.responseText);
-              const progressText = preview.querySelector('.progress-text');
-              if (xhr.status >= 200 && xhr.status < 300 && data.status === 1) {
-                progressText.textContent = data.msg;
-                uploadedUrls.push(data.url);
-                updateUrlArea();
-                preview.classList.add('success');
-              } else {
-                const errorMsg = [data.msg, data.error || '未知错误'].filter(Boolean).join(' | ');
-                progressText.textContent = errorMsg;
-                preview.classList.add('error');
+              if (xhr.status < 200 || xhr.status >= 300) {
+                reject(new Error(data.error || data.msg || ('HTTP ' + xhr.status)));
+                return;
               }
-            } catch (e) {
-              preview.querySelector('.progress-text').textContent = '✗ 响应解析失败';
-              preview.classList.add('error');
+              resolve(data);
+            } catch (error) {
+              reject(new Error('响应解析失败'));
             }
-            resolve();          // ← 关键：上传"结束"(无论成功失败)才 resolve
           });
-      
-          xhr.addEventListener('error', () => {
-            preview.querySelector('.progress-text').textContent = '✗ 网络错误';
-            preview.classList.add('error');
-            resolve();          // ← 网络异常也要 resolve，否则整个队列会卡死
-          });
-      
+          xhr.addEventListener('error', () => reject(new Error('网络错误')));
           const formData = new FormData();
           formData.append('file', file);
           formData.append('category', categorySelect.value);
-          formData.append('storage_type', document.querySelector('.storage-btn.active').dataset.storage);
+          formData.append('storage_type', storageType);
           xhr.open('POST', '/upload');
           xhr.send(formData);
         });
+      }
+      function createUploadId() {
+        if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+          return window.crypto.randomUUID().replace(/-/g, '_');
+        }
+        const random = Math.random().toString(36).slice(2);
+        return Date.now().toString(36) + '_' + random + '_' + Math.random().toString(36).slice(2);
+      }
+      function uploadChunkRequest(formData, preview, completedBytes, fileSize) {
+        return new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          const progressTrack = preview.querySelector('.progress-track');
+          const progressText = preview.querySelector('.progress-text');
+          xhr.upload.addEventListener('progress', event => {
+            if (!event.lengthComputable) return;
+            const loaded = Math.min(fileSize, completedBytes + event.loaded);
+            const percent = Math.floor(loaded / fileSize * 100);
+            progressTrack.style.width = percent + '%';
+            progressText.textContent = '分片上传 ' + percent + '%';
+          });
+          xhr.addEventListener('load', () => {
+            try {
+              const data = JSON.parse(xhr.responseText);
+              if (xhr.status < 200 || xhr.status >= 300 || data.status !== 1) {
+                reject(new Error(data.error || ('分片上传失败 HTTP ' + xhr.status)));
+                return;
+              }
+              resolve(data);
+            } catch (_) {
+              reject(new Error('分片响应解析失败'));
+            }
+          });
+          xhr.addEventListener('error', () => reject(new Error('分片上传网络错误')));
+          xhr.open('POST', '/upload-chunk');
+          xhr.send(formData);
+        });
+      }
+      async function uploadFileInChunks(file, preview, config) {
+        const chunkSize = config.telegramChunkSizeMB * 1024 * 1024;
+        const totalChunks = Math.ceil(file.size / chunkSize);
+        const uploadId = createUploadId();
+        const keyParts = file.name.split('.');
+        const extension = keyParts.length > 1 ? keyParts.pop().replace(/[^a-zA-Z0-9]/g, '').toLowerCase() : 'bin';
+        const key = Date.now() + '_' + Math.random().toString(36).slice(2, 8) + '.' + (extension || 'bin');
+        let completedBytes = 0;
+        try {
+          for (let index = 0; index < totalChunks; index++) {
+            const start = index * chunkSize;
+            const end = Math.min(start + chunkSize, file.size);
+            const chunk = file.slice(start, end);
+            let lastError = null;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                const formData = new FormData();
+                formData.append('upload_id', uploadId);
+                formData.append('chunk_index', String(index));
+                formData.append('total_chunks', String(totalChunks));
+                formData.append('file_name', file.name);
+                formData.append('file_size', String(file.size));
+                formData.append('chunk', chunk, file.name + '.part' + String(index + 1).padStart(5, '0'));
+                await uploadChunkRequest(formData, preview, completedBytes, file.size);
+                lastError = null;
+                break;
+              } catch (error) {
+                lastError = error;
+                if (attempt < 3) await new Promise(resolve => setTimeout(resolve, attempt * 800));
+              }
+            }
+            if (lastError) throw lastError;
+            completedBytes += chunk.size;
+          }
+
+          const response = await fetch('/upload-complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              upload_id: uploadId,
+              file_name: file.name,
+              file_size: file.size,
+              mime_type: file.type || 'application/octet-stream',
+              total_chunks: totalChunks,
+              category: categorySelect.value,
+              key
+            })
+          });
+          const data = await response.json();
+          if (!response.ok || data.status !== 1) {
+            throw new Error(data.error || data.msg || '合并分片失败');
+          }
+          return data;
+        } catch (error) {
+          fetch('/upload-abort', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ upload_id: uploadId })
+          }).catch(() => {});
+          throw error;
+        }
       }
       function createPreview(file) {
         const div = document.createElement('div');
@@ -6784,4 +7600,3 @@ try {
 } catch (error) {
   console.error('添加DOMContentLoaded事件监听器失败:', error);
 }
-  
