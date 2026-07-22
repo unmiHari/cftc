@@ -1151,7 +1151,7 @@ async function findFileRecord(rawInput, chatId, config) {
 
   if (isUrl) {
     let rec = await config.database.prepare(
-      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE url = ? AND chat_id = ?'
+      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE url = ? AND (chat_id = ? OR chat_id IS NULL)'
     ).bind(input, chatId).first();
     if (rec) return rec;
 
@@ -1159,21 +1159,21 @@ async function findFileRecord(rawInput, chatId, config) {
       ? 'http://' + input.slice('https://'.length)
       : 'https://' + input.slice('http://'.length);
     rec = await config.database.prepare(
-      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE url = ? AND chat_id = ?'
+      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE url = ? AND (chat_id = ? OR chat_id IS NULL)'
     ).bind(altUrl, chatId).first();
     if (rec) return rec;
   }
 
   if (basename) {
     let rec = await config.database.prepare(
-      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE (fileId = ? OR url LIKE ?) AND chat_id = ? ORDER BY created_at DESC LIMIT 1'
+      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE (fileId = ? OR url LIKE ?) AND (chat_id = ? OR chat_id IS NULL) ORDER BY created_at DESC LIMIT 1'
     ).bind(basename, `%/${basename}`, chatId).first();
     if (rec) return rec;
   }
 
   if (!isUrl) {
     let rec = await config.database.prepare(
-      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE (file_name = ? OR url LIKE ?) AND chat_id = ? ORDER BY created_at DESC LIMIT 1'
+      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE (file_name = ? OR url LIKE ?) AND (chat_id = ? OR chat_id IS NULL) ORDER BY created_at DESC LIMIT 1'
     ).bind(input, `%/${input}`, chatId).first();
     if (rec) return rec;
   }
@@ -2084,20 +2084,21 @@ async function handleUploadRequest(request, config) {
 
     const time = Date.now();
     const timestamp = new Date(time + 8 * 60 * 60 * 1000).toISOString();
-
+    
     await config.database.prepare(`
-      INSERT INTO files (url, fileId, message_id, created_at, file_name, file_size, mime_type, storage_type, category_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO files (url, fileId, message_id, created_at, file_name, file_size, mime_type, storage_type, category_id, chat_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       finalUrl,
       dbFileId,
       dbMessageId,
       timestamp,
-      file.name,       // 保留原始杂乱文件名，仅用于展示/搜索，不再影响URL
+      file.name,
       file.size,
       mimeType,
       storageType,
-      finalCategoryId
+      finalCategoryId,
+      chatId
     ).run();
 
     return new Response(
