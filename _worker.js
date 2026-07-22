@@ -739,23 +739,8 @@ async function handleTelegramWebhook(request, config) {
           await config.database.prepare('UPDATE user_settings SET waiting_for = NULL WHERE chat_id = ?')
             .bind(chatId).run();
           userSetting.waiting_for = null;
-          const userInput = update.message.text.trim();
-          let fileToDelete = null;
-          if (userInput.startsWith('http://') || userInput.startsWith('https://')) {
-            fileToDelete = await config.database.prepare(
-              'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE url = ? AND chat_id = ?'
-            ).bind(userInput, chatId).first();
-          } else {
-            let fileName = userInput;
-            if (!fileName.includes('.')) {
-              await sendMessage(chatId, "⚠️ 请输入完整的文件名称（包含扩展名）或完整URL", config.tgBotToken);
-              await sendPanel(chatId, userSetting, config);
-              return new Response('OK');
-            }
-            fileToDelete = await config.database.prepare(
-              'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE (file_name = ? OR url LIKE ?) AND chat_id = ? ORDER BY created_at DESC LIMIT 1'
-            ).bind(fileName, `%/${fileName}`, chatId).first();
-          }
+          const userInput = update.message.text;
+          let fileToDelete = await findFileRecord(userInput, chatId, config);
           if (!fileToDelete) {
             await sendMessage(chatId, "⚠️ 未找到匹配的文件，请输入完整的文件名称或URL", config.tgBotToken);
             await sendPanel(chatId, userSetting, config);
@@ -1128,6 +1113,72 @@ function getKeyboardLayout(userSetting) {
       ]
     ]
   };
+}
+// 生成简洁的存储 key，避免用杂乱原始文件名拼URL
+function generateSafeKey(originalName) {
+  let ext = 'bin';
+  if (originalName && originalName.includes('.')) {
+    const rawExt = originalName.split('.').pop();
+    const cleanExt = rawExt.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+    if (cleanExt) ext = cleanExt;
+  }
+  const randomPart = Math.random().toString(36).slice(2, 8); // 6位随机字符
+  return `${Date.now()}_${randomPart}.${ext}`;
+}
+
+// 去除零宽字符/首尾空白，防止复制粘贴带入不可见字符导致匹配失败
+function normalizeInput(str) {
+  return (str || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+}
+
+// 从URL或文本中提取路径最后一段（文件名部分）
+function extractKeyFromInput(input) {
+  try {
+    if (input.startsWith('http://') || input.startsWith('https://')) {
+      const u = new URL(input);
+      return decodeURIComponent(u.pathname.split('/').pop());
+    }
+  } catch (e) {}
+  return input.split('/').pop();
+}
+
+// 综合查找：精确URL -> http/https互换 -> basename(fileId/url片段) -> 原始文件名
+async function findFileRecord(rawInput, chatId, config) {
+  const input = normalizeInput(rawInput);
+  if (!input) return null;
+  const isUrl = input.startsWith('http://') || input.startsWith('https://');
+  const basename = extractKeyFromInput(input);
+
+  if (isUrl) {
+    let rec = await config.database.prepare(
+      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE url = ? AND chat_id = ?'
+    ).bind(input, chatId).first();
+    if (rec) return rec;
+
+    const altUrl = input.startsWith('https://')
+      ? 'http://' + input.slice('https://'.length)
+      : 'https://' + input.slice('http://'.length);
+    rec = await config.database.prepare(
+      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE url = ? AND chat_id = ?'
+    ).bind(altUrl, chatId).first();
+    if (rec) return rec;
+  }
+
+  if (basename) {
+    let rec = await config.database.prepare(
+      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE (fileId = ? OR url LIKE ?) AND chat_id = ? ORDER BY created_at DESC LIMIT 1'
+    ).bind(basename, `%/${basename}`, chatId).first();
+    if (rec) return rec;
+  }
+
+  if (!isUrl) {
+    let rec = await config.database.prepare(
+      'SELECT id, fileId, message_id, storage_type, url, file_name FROM files WHERE (file_name = ? OR url LIKE ?) AND chat_id = ? ORDER BY created_at DESC LIMIT 1'
+    ).bind(input, `%/${input}`, chatId).first();
+    if (rec) return rec;
+  }
+
+  return null;
 }
 async function handleCallbackQuery(update, config, userSetting) {
   const chatId = update.callback_query.from.id.toString();
@@ -1585,9 +1636,7 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     }));
     const storageType = userSetting && userSetting.storage_type ? userSetting.storage_type : 'r2';
     let finalUrl, dbFileId, dbMessageId;
-    const timestamp = Date.now();
-    const originalFileName = fileName.replace(/[^a-zA-Z0-9\-\_\.]/g, '_'); 
-    const key = `${timestamp}_${originalFileName}`;
+    const key = generateSafeKey(fileName); // 使用随机安全key，杂乱的原始文件名只保存进 file_name 字段
     if (storageType === 'r2' && config.bucket) {
       const arrayBuffer = await fileResponse.arrayBuffer();
       await config.bucket.put(key, arrayBuffer, { 
@@ -1984,8 +2033,10 @@ async function handleUploadRequest(request, config) {
     const finalCategoryId = categoryId || (defaultCategory ? defaultCategory.id : null);
     await config.database.prepare('UPDATE user_settings SET storage_type = ?, current_category_id = ? WHERE chat_id = ?')
       .bind(storageType, finalCategoryId, chatId).run();
-    const ext = (file.name.split('.').pop() || '').toLowerCase();
-    const mimeType = getContentType(ext);
+
+    // 原始扩展名（仅用于判断 MIME 类型 / Telegram 上传方法，不再直接拼进 URL）
+    const rawExt = (file.name.split('.').pop() || '').toLowerCase();
+    const mimeType = file.type || getContentType(rawExt);
     const [mainType] = mimeType.split('/');
     const typeMap = {
       image: { method: 'sendPhoto', field: 'photo' },
@@ -1997,11 +2048,16 @@ async function handleUploadRequest(request, config) {
       method = 'sendDocument';
       field = 'document';
     }
-    let finalUrl, dbFileId, dbMessageId;
+
+    // 统一在这里生成一次 key，全程复用，避免存储路径与数据库URL不一致
+    const key = generateSafeKey(file.name);
+    const finalUrl = `https://${config.domain}/${key}`;
+
+    let dbFileId, dbMessageId;
+
     if (storageType === 'r2') {
-      const key = `${Date.now()}.${ext}`;
+      if (!config.bucket) throw new Error('未配置R2存储桶(BUCKET)，无法使用R2存储');
       await config.bucket.put(key, await file.arrayBuffer(), { httpMetadata: { contentType: mimeType } });
-      finalUrl = `https://${config.domain}/${key}`;
       dbFileId = key;
       dbMessageId = -1;
     } else {
@@ -2022,29 +2078,30 @@ async function handleUploadRequest(request, config) {
                      (result.photo && result.photo[result.photo.length - 1]?.file_id);
       if (!fileId) throw new Error('未获取到文件ID');
       if (!messageId) throw new Error('未获取到tg消息ID');
-      finalUrl = `https://${config.domain}/${Date.now()}.${ext}`;
       dbFileId = fileId;
       dbMessageId = messageId;
     }
+
     const time = Date.now();
     const timestamp = new Date(time + 8 * 60 * 60 * 1000).toISOString();
-    const url = `https://${config.domain}/${time}.${ext}`;
+
     await config.database.prepare(`
       INSERT INTO files (url, fileId, message_id, created_at, file_name, file_size, mime_type, storage_type, category_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
-      url,
+      finalUrl,
       dbFileId,
       dbMessageId,
       timestamp,
-      file.name,
+      file.name,       // 保留原始杂乱文件名，仅用于展示/搜索，不再影响URL
       file.size,
-      file.type || getContentType(ext),
+      mimeType,
       storageType,
       finalCategoryId
     ).run();
+
     return new Response(
-      JSON.stringify({ status: 1, msg: "✔ 上传成功", url }),
+      JSON.stringify({ status: 1, msg: "✔ 上传成功", url: finalUrl }),
       { headers: { 'Content-Type': 'application/json' } }
     );
   } catch (error) {
