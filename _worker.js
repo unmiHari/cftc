@@ -116,7 +116,10 @@ async function validateDatabaseStructure(config) {
         { name: 'storage_type', type: 'TEXT' },
         { name: 'current_category_id', type: 'INTEGER' },
         { name: 'waiting_for', type: 'TEXT' },
-        { name: 'editing_file_id', type: 'TEXT' }
+        { name: 'editing_file_id', type: 'TEXT' },
+        { name: 'is_processing', type: 'INTEGER' },
+        { name: 'lock_time', type: 'INTEGER' },
+        { name: 'upload_seq', type: 'INTEGER' }
       ],
       files: [
         { name: 'id', type: 'INTEGER' },
@@ -3405,8 +3408,8 @@ function generateUploadPage(categoryOptions, storageType) {
           xhr.upload.addEventListener('progress', (e) => {
             if (e.lengthComputable) {
               const percent = Math.round((e.loaded / e.total) * 100);
-              progressTrack.style.width = `${percent}%`;
-              progressText.textContent = `${percent}%`;
+              progressTrack.style.width = \`\${percent}%\`;
+              progressText.textContent = \`\${percent}%\`;
             }
           });
       
