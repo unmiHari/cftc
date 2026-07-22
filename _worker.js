@@ -1912,13 +1912,14 @@ async function generateMainMenu(chatId, userSetting, config) {
   }
   const defaultNotification = 
     "➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链";
+  // ${notificationText || defaultNotification} // 放在 📤 超出20MB请使用上传大文件 和 👇 请选择操作 之间
   const messageBody = `☁️ <b>图床助手v2</b>
   📂 当前存储：${storageText}
   📁 当前分类：${categoryName}
   📊 已上传：${stats && stats.total_files ? stats.total_files : 0} 个文件
   💾 已用空间：${formatSize(stats && stats.total_size ? stats.total_size : 0)}
   📤 超出20MB请使用上传大文件
-  ${notificationText || defaultNotification}
+  
   👇 请选择操作：`;
   const keyboard = getKeyboardLayout(
     userSetting,
