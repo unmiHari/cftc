@@ -1537,64 +1537,37 @@ async function handleTelegramWebhook(request, config, executionCtx = null) {
         }
       }
       else if (userSetting.waiting_for === 'new_suffix' && update.message.text && userSetting.editing_file_id) {
-        const newSuffix = update.message.text.trim();
         const fileId = userSetting.editing_file_id;
         try {
-          const file = await config.database.prepare('SELECT * FROM files WHERE id = ?').bind(fileId).first();
+          const file = await config.database.prepare(
+            'SELECT * FROM files WHERE id = ? AND chat_id = ?'
+          ).bind(fileId, chatId).first();
           if (!file) {
-            await sendMessage(chatId, "⚠️ 文件不存在或已被删除", config.tgBotToken);
+            await sendMessage(chatId, "⚠️ 文件不存在、已被删除或不属于当前用户", config.tgBotToken);
           } else {
-            const originalFileName = getFileName(file.url);
-            const fileExt = originalFileName.split('.').pop();
-            const newFileName = `${newSuffix}.${fileExt}`;
-            const fileUrl = `https://${config.domain}/${newFileName}`;
-            let success = false;
-            if (file.storage_type === 'telegram') {
-              await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-                .bind(fileUrl, file.id).run();
-              success = true;
-            } 
-            else if (file.storage_type === 'r2' && config.bucket) {
-              try {
-                const fileId = file.fileId || originalFileName;
-                const r2File = await config.bucket.get(fileId);
-                if (r2File) {
-                  const fileData = await r2File.arrayBuffer();
-                  await storeFile(fileData, newFileName, r2File.httpMetadata.contentType, config);
-                  await deleteFile(fileId, config);
-                  await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE id = ?')
-                    .bind(newFileName, fileUrl, file.id).run();
-                  success = true;
-                } else {
-                  await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-                    .bind(fileUrl, file.id).run();
-                  success = true;
-                }
-              } catch (error) {
-                console.error('处理R2文件重命名失败:', error);
-                await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-                  .bind(fileUrl, file.id).run();
-                success = true;
-              }
-            } 
-            else {
-              await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-                .bind(fileUrl, file.id).run();
-              success = true;
-            }
-            if (success) {
-              await sendMessage(chatId, `✅ 后缀修改成功！\n\n新链接：${fileUrl}`, config.tgBotToken);
-            } else {
-              await sendMessage(chatId, "❌ 后缀修改失败，请稍后重试", config.tgBotToken);
-            }
+            const renamed = await renameStoredFileRecord(
+              file,
+              update.message.text,
+              config
+            );
+            const chunkText = renamed.isChunked
+              ? `
+🧩 分片：${renamed.chunkCount} 个（无需重新上传分片）`
+              : '';
+            await sendMessage(
+              chatId,
+              `✅ 文件名修改成功！${chunkText}
+
+新名称：${escapeHtml(renamed.fileName)}
+新链接：${renamed.url}`,
+              config.tgBotToken
+            );
           }
         } catch (error) {
-          console.error('修改后缀失败:', error);
-          await sendMessage(chatId, `❌ 修改后缀失败: ${error.message}`, config.tgBotToken);
+          console.error('修改文件名失败:', error);
+          await sendMessage(chatId, `❌ 修改失败: ${escapeHtml(error.message)}`, config.tgBotToken);
         }
-        await config.database.prepare('UPDATE user_settings SET waiting_for = NULL, editing_file_id = NULL WHERE chat_id = ?').bind(chatId).run();
-        userSetting.waiting_for = null;
-        userSetting.editing_file_id = null;
+        await resetWaitingState(chatId, userSetting, config);
         await sendPanel(chatId, userSetting, config);
         return new Response('OK');
       }
@@ -1793,64 +1766,33 @@ async function handleTelegramWebhook(request, config, executionCtx = null) {
             return new Response('OK');
           }
         } else if (userSetting.waiting_for === 'edit_suffix_input_new' && message.text && userSetting.editing_file_id) {
-          const newSuffix = message.text.trim();
           const fileId = userSetting.editing_file_id;
           try {
-            const file = await config.database.prepare('SELECT * FROM files WHERE id = ?').bind(fileId).first();
+            const file = await config.database.prepare(
+              'SELECT * FROM files WHERE id = ? AND chat_id = ?'
+            ).bind(fileId, chatId).first();
             if (!file) {
-              await sendMessage(chatId, "⚠️ 文件不存在或已被删除", config.tgBotToken);
+              await sendMessage(chatId, "⚠️ 文件不存在、已被删除或不属于当前用户", config.tgBotToken);
             } else {
-              const originalFileName = getFileName(file.url);
-              const fileExt = originalFileName.split('.').pop();
-              const newFileName = `${newSuffix}.${fileExt}`;
-              const fileUrl = `https://${config.domain}/${newFileName}`;
-              let success = false;
-              if (file.storage_type === 'telegram') {
-                await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-                  .bind(fileUrl, file.id).run();
-                success = true;
-              } 
-              else if (file.storage_type === 'r2' && config.bucket) {
-                try {
-                  const fileId = file.fileId || originalFileName;
-                  const r2File = await config.bucket.get(fileId);
-                  if (r2File) {
-                    const fileData = await r2File.arrayBuffer();
-                    await storeFile(fileData, newFileName, r2File.httpMetadata.contentType, config);
-                    await deleteFile(fileId, config);
-                    await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE id = ?')
-                      .bind(newFileName, fileUrl, file.id).run();
-                    success = true;
-                  } else {
-                    await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-                      .bind(fileUrl, file.id).run();
-                    success = true;
-                  }
-                } catch (error) {
-                  console.error('处理R2文件重命名失败:', error);
-                  await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-                    .bind(fileUrl, file.id).run();
-                  success = true;
-                }
-              } 
-              else {
-                await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-                  .bind(fileUrl, file.id).run();
-                success = true;
-              }
-              if (success) {
-                await sendMessage(chatId, `✅ 后缀修改成功！\n\n新链接：${fileUrl}`, config.tgBotToken);
-              } else {
-                await sendMessage(chatId, "❌ 后缀修改失败，请稍后重试", config.tgBotToken);
-              }
+              const renamed = await renameStoredFileRecord(file, message.text, config);
+              const chunkText = renamed.isChunked
+                ? `
+🧩 分片：${renamed.chunkCount} 个（无需重新上传分片）`
+                : '';
+              await sendMessage(
+                chatId,
+                `✅ 文件名修改成功！${chunkText}
+
+新名称：${escapeHtml(renamed.fileName)}
+新链接：${renamed.url}`,
+                config.tgBotToken
+              );
             }
           } catch (error) {
-            console.error('修改后缀失败:', error);
-            await sendMessage(chatId, `❌ 修改后缀失败: ${error.message}`, config.tgBotToken);
+            console.error('修改文件名失败:', error);
+            await sendMessage(chatId, `❌ 修改失败: ${escapeHtml(error.message)}`, config.tgBotToken);
           }
-          await config.database.prepare('UPDATE user_settings SET waiting_for = NULL, editing_file_id = NULL WHERE chat_id = ?').bind(chatId).run();
-          userSetting.waiting_for = null;
-          userSetting.editing_file_id = null;
+          await resetWaitingState(chatId, userSetting, config);
           await sendPanel(chatId, userSetting, config);
           return new Response('OK');
         } else if (message.text && message.text !== '/start') {
@@ -2686,7 +2628,8 @@ async function handleCallbackQuery(update, config, userSetting) {
     else if (cbData === 'edit_suffix') {
       await answerPromise;
       const recentFiles = await config.database.prepare(`
-        SELECT id, url, fileId, file_name, created_at, storage_type
+        SELECT id, url, fileId, file_name, created_at, storage_type,
+               is_chunked, chunk_count
         FROM files
         WHERE chat_id = ?
         ORDER BY created_at DESC
@@ -2698,8 +2641,11 @@ async function handleCallbackQuery(update, config, userSetting) {
       }
       const keyboard = {
         inline_keyboard: recentFiles.results.map(file => {
-          const fileName = file.file_name || getFileName(file.url);
-          return [{ text: fileName, callback_data: `edit_suffix_file_${file.id}` }];
+          const fileName = getStoredDisplayName(file);
+          const chunkLabel = Number(file.is_chunked || 0) === 1
+            ? ` 🧩${Number(file.chunk_count || 0)}`
+            : '';
+          return [{ text: `${fileName}${chunkLabel}`, callback_data: `edit_suffix_file_${file.id}` }];
         }).concat([[{ text: "« 返回", callback_data: "back_to_panel" }]])
       };
       await fetch(telegramMethodUrl(config.tgBotToken, 'sendMessage', config), {
@@ -2712,9 +2658,109 @@ async function handleCallbackQuery(update, config, userSetting) {
         })
       });
     }
+    else if (cbData.startsWith('edit_suffix_file_')) {
+      await answerPromise;
+      const fileId = Number(cbData.slice('edit_suffix_file_'.length));
+      if (!Number.isInteger(fileId) || fileId <= 0) {
+        await sendMessage(chatId, "❌ 文件标识无效", config.tgBotToken);
+        return;
+      }
+      const file = await config.database.prepare(`
+        SELECT * FROM files
+        WHERE id = ? AND chat_id = ?
+        LIMIT 1
+      `).bind(fileId, chatId).first();
+      if (!file) {
+        await sendMessage(chatId, "⚠️ 文件不存在、已被删除或不属于当前用户", config.tgBotToken);
+        return;
+      }
+      await config.database.prepare(`
+        UPDATE user_settings
+        SET waiting_for = 'new_suffix', editing_file_id = ?
+        WHERE chat_id = ?
+      `).bind(file.id, chatId).run();
+      userSetting.waiting_for = 'new_suffix';
+      userSetting.editing_file_id = file.id;
+      const fileName = getStoredDisplayName(file);
+      const chunkText = Number(file.is_chunked || 0) === 1
+        ? `
+🧩 这是分片文件，共 ${Number(file.chunk_count || 0)} 片；修改名称不会重新上传分片。`
+        : '';
+      await sendInputPrompt(
+        chatId,
+        `✏️ 当前文件：${escapeHtml(fileName)}${chunkText}
+
+请输入新的文件名主体（无需输入扩展名）`,
+        config
+      );
+      return;
+    }
+    else if (cbData.startsWith('delete_file_confirm_')) {
+      await answerPromise;
+      const fileId = Number(cbData.slice('delete_file_confirm_'.length));
+      const file = Number.isInteger(fileId) && fileId > 0
+        ? await config.database.prepare(`
+            SELECT * FROM files WHERE id = ? AND chat_id = ? LIMIT 1
+          `).bind(fileId, chatId).first()
+        : null;
+      if (!file) {
+        await sendMessage(chatId, "⚠️ 文件不存在、已被删除或不属于当前用户", config.tgBotToken);
+        return;
+      }
+      const chunkText = Number(file.is_chunked || 0) === 1
+        ? `
+🧩 将同时删除 ${Number(file.chunk_count || 0)} 个分片和 1 个清单文件。`
+        : '';
+      await fetch(telegramMethodUrl(config.tgBotToken, 'sendMessage', config), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: `⚠️ 确定删除“${getStoredDisplayName(file)}”吗？${chunkText}
+
+删除后直链将立即失效。`,
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '✅ 确认删除', callback_data: `delete_file_do_${file.id}` },
+              { text: '取消', callback_data: 'back_to_panel' }
+            ]]
+          }
+        })
+      });
+      return;
+    }
+    else if (cbData.startsWith('delete_file_do_')) {
+      await answerPromise;
+      const fileId = Number(cbData.slice('delete_file_do_'.length));
+      const file = Number.isInteger(fileId) && fileId > 0
+        ? await config.database.prepare(`
+            SELECT * FROM files WHERE id = ? AND chat_id = ? LIMIT 1
+          `).bind(fileId, chatId).first()
+        : null;
+      if (!file) {
+        await sendMessage(chatId, "⚠️ 文件不存在、已被删除或不属于当前用户", config.tgBotToken);
+        return;
+      }
+      const fileName = getStoredDisplayName(file);
+      const deleted = await deleteStoredFileRecord(file, config);
+      await deleteCallbackSourceMessage(update, config);
+      const warning = deleted.failedTelegramMessages.length
+        ? `
+⚠️ ${deleted.failedTelegramMessages.length} 条 Telegram 存储消息未能立即删除，但文件记录和直链已清理。`
+        : '';
+      await sendMessage(
+        chatId,
+        `✅ 已删除：${escapeHtml(fileName)}
+🧩 清理分片：${deleted.deletedChunkRows} 个${warning}`,
+        config.tgBotToken
+      );
+      await sendPanel(chatId, userSetting, config);
+      return;
+    }
     else if (cbData === 'recent_files') {
       const recentFilesPromise = config.database.prepare(`
-        SELECT id, url, created_at, file_name, storage_type
+        SELECT id, url, created_at, file_name, file_size, storage_type,
+               is_chunked, chunk_count
         FROM files
         WHERE chat_id = ?
         ORDER BY created_at DESC
@@ -2727,15 +2773,23 @@ async function handleCallbackQuery(update, config, userSetting) {
         return;
       }
       const filesList = recentFiles.results.map((file, i) => {
-        const fileName = file.file_name || getFileName(file.url);
+        const fileName = getStoredDisplayName(file);
         const date = formatDate(file.created_at);
         const storageEmoji = file.storage_type === 'r2' ? '☁️' : '✈️';
-        return `${i + 1}. ${fileName}\n   📅 ${date} ${storageEmoji}\n   🔗 ${file.url}`;
+        const chunkText = Number(file.is_chunked || 0) === 1
+          ? ` · 🧩 ${Number(file.chunk_count || 0)}片`
+          : '';
+        return `${i + 1}. ${fileName}\n   📦 ${formatSize(file.file_size || 0)}${chunkText}\n   📅 ${date} ${storageEmoji}\n   🔗 ${file.url}`;
       }).join('\n\n');
+      const actionRows = recentFiles.results.map((file, index) => ([
+        { text: `🔗 ${index + 1}`, url: file.url },
+        { text: `✏️ ${index + 1}`, callback_data: `edit_suffix_file_${file.id}` },
+        { text: `🗑️ ${index + 1}`, callback_data: `delete_file_confirm_${file.id}` }
+      ]));
       const keyboard = {
-        inline_keyboard: [
+        inline_keyboard: actionRows.concat([
           [{ text: "« 返回", callback_data: "back_to_panel" }]
-        ]
+        ])
       };
       await deleteCallbackSourceMessage(
         update,
@@ -2813,10 +2867,6 @@ async function handleCallbackQuery(update, config, userSetting) {
       );
     
       return;
-    }
-    else if (cbData.startsWith('delete_file_confirm_')) {
-    }
-    else if (cbData.startsWith('delete_file_do_')) {
     }
     else if (userSetting.waiting_for === 'edit_suffix_input_file' && update.message.text) {
       console.error('错误: 不应该执行到这里，修改后缀的逻辑已移至handleTelegramWebhook函数');
@@ -3466,29 +3516,217 @@ function encodeContentDispositionFileName(fileName) {
     );
 }
 
+function getStoredDisplayName(file) {
+  if (!file) return 'download.bin';
+  const candidate = String(file.file_name || '').trim();
+  if (candidate) return candidate;
+  try {
+    return decodeURIComponent(new URL(String(file.url || '')).pathname.split('/').pop()) || 'download.bin';
+  } catch (_) {
+    return String(file.url || '').split('/').pop() || 'download.bin';
+  }
+}
+
+function splitStoredFileName(fileName) {
+  const safeName = sanitizeTelegramFileName(fileName, 'file.bin');
+  const lastDot = safeName.lastIndexOf('.');
+  if (lastDot <= 0 || lastDot === safeName.length - 1) {
+    return { stem: safeName, extension: '' };
+  }
+  return {
+    stem: safeName.slice(0, lastDot),
+    extension: safeName.slice(lastDot + 1)
+  };
+}
+
+function normalizePublicFileStem(value) {
+  let stem = String(value || '')
+    .replace(/[\u0000-\u001F\u007F]/g, '')
+    .replace(/[\\/]/g, '_')
+    .trim();
+  stem = stem.replace(/\s+/g, ' ');
+  // 用户偶尔会把完整文件名贴进来；只移除与旧文件相同扩展名由调用处处理。
+  if (!stem) throw new Error('新文件名不能为空');
+  if (stem === '.' || stem === '..') throw new Error('新文件名无效');
+  if (stem.length > 120) throw new Error('新文件名不能超过 120 个字符');
+  return stem;
+}
+
+function invalidateStoredFileCache(file, config, extraPaths = []) {
+  if (!config || !config.fileCache) return;
+  const paths = new Set(extraPaths.filter(Boolean));
+  if (file && file.url) {
+    try {
+      paths.add(decodeURIComponent(new URL(file.url).pathname.split('/').pop()));
+    } catch (_) {
+      paths.add(String(file.url).split('/').pop());
+    }
+  }
+  for (const path of paths) {
+    if (path) config.fileCache.delete(`file:${path}`);
+  }
+}
+
+async function renameStoredFileRecord(file, requestedStem, config) {
+  if (!file || !file.id) throw new Error('文件不存在');
+  const oldName = getStoredDisplayName(file);
+  const { extension } = splitStoredFileName(oldName);
+  let stem = normalizePublicFileStem(requestedStem);
+  if (extension && stem.toLowerCase().endsWith(`.${extension.toLowerCase()}`)) {
+    stem = stem.slice(0, -(extension.length + 1)).trim();
+    if (!stem) throw new Error('新文件名不能为空');
+  }
+  const newFileName = extension ? `${stem}.${extension}` : stem;
+  const encodedPath = encodeURIComponent(newFileName).replace(/%2F/gi, '_');
+  const newUrl = `https://${config.domain}/${encodedPath}`;
+
+  const conflict = await config.database.prepare(`
+    SELECT id FROM files
+    WHERE id != ? AND (url = ? OR file_name = ?)
+    LIMIT 1
+  `).bind(file.id, newUrl, newFileName).first();
+  if (conflict) throw new Error('该文件名或直链已被使用');
+
+  const oldPath = (() => {
+    try { return decodeURIComponent(new URL(file.url).pathname.split('/').pop()); }
+    catch (_) { return String(file.url || '').split('/').pop(); }
+  })();
+
+  let newStorageKey = file.fileId;
+  let copiedR2Object = false;
+  if (file.storage_type === 'r2' && config.bucket && file.fileId) {
+    const object = await config.bucket.get(file.fileId);
+    if (!object) throw new Error('R2 中未找到原文件，无法重命名');
+    newStorageKey = newFileName;
+    if (newStorageKey !== file.fileId) {
+      await config.bucket.put(newStorageKey, object.body, {
+        httpMetadata: object.httpMetadata,
+        customMetadata: object.customMetadata
+      });
+      copiedR2Object = true;
+    }
+  }
+
+  let fileRowUpdated = false;
+  try {
+    await config.database.prepare(`
+      UPDATE files
+      SET url = ?, file_name = ?, custom_suffix = ?, fileId = ?
+      WHERE id = ?
+    `).bind(
+      newUrl,
+      newFileName,
+      stem,
+      newStorageKey,
+      file.id
+    ).run();
+    fileRowUpdated = true;
+
+    // 专属大文件页完成后会保存永久直链；改名时同步更新，避免状态页返回旧地址。
+    await config.database.prepare(`
+      UPDATE bot_upload_sessions
+      SET result_url = ?, file_name = ?
+      WHERE result_file_id = ? AND status = 'completed'
+    `).bind(newUrl, newFileName, file.id).run();
+  } catch (error) {
+    if (fileRowUpdated) {
+      try {
+        await config.database.prepare(`
+          UPDATE files
+          SET url = ?, file_name = ?, custom_suffix = ?, fileId = ?
+          WHERE id = ?
+        `).bind(
+          file.url,
+          file.file_name || oldName,
+          file.custom_suffix || null,
+          file.fileId,
+          file.id
+        ).run();
+      } catch (rollbackError) {
+        console.error('回滚文件名修改失败:', rollbackError);
+      }
+    }
+    if (copiedR2Object && newStorageKey && newStorageKey !== file.fileId) {
+      try { await config.bucket.delete(newStorageKey); } catch (_) {}
+    }
+    throw error;
+  }
+
+  // 数据库已经指向新对象后，旧 R2 对象删除失败不应回滚新名称，避免把记录指向已删除对象。
+  if (copiedR2Object && file.fileId !== newStorageKey) {
+    try {
+      await config.bucket.delete(file.fileId);
+    } catch (cleanupError) {
+      console.warn(`旧 R2 对象 ${file.fileId} 删除失败:`, cleanupError.message);
+    }
+  }
+
+  invalidateStoredFileCache(file, config, [oldPath, encodedPath, newFileName]);
+  return {
+    id: Number(file.id),
+    url: newUrl,
+    fileName: newFileName,
+    storageType: file.storage_type,
+    isChunked: Number(file.is_chunked || 0) === 1,
+    chunkCount: Number(file.chunk_count || 0)
+  };
+}
+
 async function deleteStoredFileRecord(file, config) {
-  if (!file) throw new Error('文件不存在');
+  if (!file || !file.id) throw new Error('文件不存在');
+
+  const failedTelegramMessages = [];
+  let deletedChunkRows = 0;
+  let deletedStorageMessages = 0;
+
+  // 先使完成会话中的旧直链失效，避免外键或状态页残留。
+  await config.database.prepare(`
+    UPDATE bot_upload_sessions
+    SET status = 'cancelled', result_file_id = NULL, result_url = NULL,
+        error_message = '文件已删除'
+    WHERE result_file_id = ? OR (upload_id = ? AND upload_id IS NOT NULL)
+  `).bind(file.id, file.upload_id || null).run();
 
   if (file.storage_type === 'telegram') {
-    if (Number(file.is_chunked || 0) === 1) {
-      const result = await config.database.prepare(`
-        SELECT message_id FROM file_chunks
-        WHERE file_id = ? ORDER BY chunk_index ASC
-      `).bind(file.id).all();
-      for (const chunk of (result.results || [])) {
-        await deleteTelegramStorageMessage(chunk.message_id, config);
-      }
-      await config.database.prepare('DELETE FROM file_chunks WHERE file_id = ?').bind(file.id).run();
+    const chunkResult = await config.database.prepare(`
+      SELECT id, message_id
+      FROM file_chunks
+      WHERE file_id = ? OR (upload_id = ? AND ? IS NOT NULL)
+      ORDER BY chunk_index ASC
+    `).bind(file.id, file.upload_id || null, file.upload_id || null).all();
+    const chunks = chunkResult.results || [];
+    deletedChunkRows = chunks.length;
+
+    for (const chunk of chunks) {
+      if (!chunk.message_id) continue;
+      const deleted = await deleteTelegramStorageMessage(chunk.message_id, config);
+      if (deleted) deletedStorageMessages++;
+      else failedTelegramMessages.push(Number(chunk.message_id));
     }
-    await deleteTelegramStorageMessage(file.message_id, config);
+
+    if (file.message_id) {
+      const manifestDeleted = await deleteTelegramStorageMessage(file.message_id, config);
+      if (manifestDeleted) deletedStorageMessages++;
+      else failedTelegramMessages.push(Number(file.message_id));
+    }
+
+    await config.database.prepare(`
+      DELETE FROM file_chunks
+      WHERE file_id = ? OR (upload_id = ? AND ? IS NOT NULL)
+    `).bind(file.id, file.upload_id || null, file.upload_id || null).run();
   } else if (file.storage_type === 'r2' && config.bucket && file.fileId) {
     await config.bucket.delete(file.fileId);
   }
 
   await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
-  const path = file.url ? String(file.url).split('/').pop() : '';
-  if (path && config.fileCache) config.fileCache.delete(`file:${path}`);
-  return true;
+  invalidateStoredFileCache(file, config, [getStoredDisplayName(file)]);
+
+  return {
+    deleted: true,
+    deletedChunkRows,
+    deletedStorageMessages,
+    failedTelegramMessages
+  };
 }
 
 
@@ -3852,8 +4090,7 @@ async function handleMediaUpload(
     const cloudDownloadLimit = 20 * 1024 * 1024;
     if (!config.allowLargeBotDownloads && declaredSize > cloudDownloadLimit) {
       throw new Error(
-        `官方云端 Bot API 的 getFile 只能下载不超过 20MB 的文件。` +
-        `请配置本地 Bot API Server，并设置 TG_FILE_PROXY_URL（或确认本地文件端点可直接访问）`
+        `文件超出官方限制`
       );
     }
 
@@ -3885,8 +4122,7 @@ async function handleMediaUpload(
     if (!actualSize) throw new Error('Telegram 未返回有效文件大小');
     if (!config.allowLargeBotDownloads && actualSize > cloudDownloadLimit) {
       throw new Error(
-        `文件为 ${formatSize(actualSize)}，超过官方云端 Bot API 的 20MB 下载限制；` +
-        `请启用本地 Bot API Server 和文件代理`
+        `文件为 ${formatSize(actualSize)}，超过官方限制；`
       );
     }
     if (actualSize > Number(config.maxSizeMB) * 1024 * 1024) {
@@ -4817,7 +5053,7 @@ async function handleLargeUploadCompleteRequest(request, config) {
         `✅ <b>大文件上传完成</b>\n\n` +
         `📄 文件：${escapeHtml(session.file_name)}\n` +
         `📦 大小：${formatSize(Number(session.file_size || 0))}\n` +
-        `🧩 分片：${Number(session.total_chunks || 0)}\n\n` +
+        //`🧩 分片：${Number(session.total_chunks || 0)}\n\n` +
         `🔗 ${escapeHtml(file.url)}`,
         config.tgBotToken
       );
@@ -5164,8 +5400,12 @@ async function handleDeleteMultipleRequest(request, config) {
           results.failed.push({ url, reason: '未找到文件记录' });
           continue;
         }
-        await deleteStoredFileRecord(file, config);
-        results.success.push(url);
+        const deleted = await deleteStoredFileRecord(file, config);
+        results.success.push({
+          url,
+          deletedChunks: deleted.deletedChunkRows,
+          cleanupWarnings: deleted.failedTelegramMessages
+        });
       } catch (error) {
         results.failed.push({ url, reason: error.message });
       }
@@ -5387,7 +5627,10 @@ async function handleAdminRequest(request, config) {
       ? categories.results.map(c => `<option value="${c.id}">${c.name}</option>`).join('')
       : '<option value="">暂无分类</option>';
     const files = await config.database.prepare(`
-      SELECT f.url, f.fileId, f.message_id, f.created_at, f.file_name, f.file_size, f.mime_type, f.storage_type, c.name as category_name, c.id as category_id
+      SELECT f.id, f.url, f.fileId, f.message_id, f.created_at, f.file_name,
+             f.file_size, f.mime_type, f.storage_type, f.is_chunked,
+             f.chunk_count, f.upload_id,
+             c.name as category_name, c.id as category_id
       FROM files f
       LEFT JOIN categories c ON f.category_id = c.id
       ORDER BY f.created_at DESC
@@ -5398,19 +5641,20 @@ async function handleAdminRequest(request, config) {
         const url = file.url;
         const uniqueId = `file-checkbox-${encodeURIComponent(url)}`;
         return `
-          <div class="file-card" data-url="${url}" data-category-id="${file.category_id || ''}">
+          <div class="file-card" data-file-id="${file.id}" data-url="${url}" data-category-id="${file.category_id || ''}" data-chunked="${Number(file.is_chunked || 0)}">
             <input type="checkbox" id="${uniqueId}" name="selectedFile" class="file-checkbox" value="${url}">
             <div class="file-preview">
               ${getPreviewHtml(url)}
             </div>
             <div class="file-info">
-              <div>${getFileName(url)}</div>
+              <div>${getStoredDisplayName(file)}</div>
               <div>大小: ${formatSize(file.file_size || 0)}</div>
+              <div>存储: ${file.storage_type === 'r2' ? 'R2' : (Number(file.is_chunked || 0) === 1 ? `Telegram 分片（${Number(file.chunk_count || 0)}片）` : 'Telegram')}</div>
               <div>上传时间: ${formatDate(file.created_at)}</div>
               <div>分类: ${file.category_name || '无分类'}</div>
             </div>
             <div class="file-actions" style="display:flex; gap:5px; justify-content:space-between; padding:10px;">
-              <button class="btn btn-share" style="flex:1; background-color:#3498db; color:white; padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:bold;" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
+              <button class="btn btn-share" style="flex:1; background-color:#3498db; color:white; padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:bold;" onclick="shareFile('${url}', '${getStoredDisplayName(file)}')">分享</button>
               <button class="btn btn-delete" style="flex:1;" onclick="showConfirmModal('确定要删除这个文件吗？', function() { deleteFile('${url}'); })">删除</button>
               <button class="btn btn-edit" style="flex:1;" onclick="showEditSuffixModal('${url}')">修改后缀</button>
             </div>
@@ -5434,7 +5678,8 @@ async function handleSearchRequest(request, config) {
     const { query } = await request.json();
     const searchPattern = `%${query}%`;
     const files = await config.database.prepare(`
-      SELECT url, fileId, message_id, created_at, file_name, file_size, mime_type
+      SELECT id, url, fileId, message_id, created_at, file_name, file_size,
+             mime_type, storage_type, is_chunked, chunk_count, upload_id
        FROM files 
        WHERE file_name LIKE ? ESCAPE '!'
        COLLATE NOCASE
@@ -5634,8 +5879,16 @@ async function handleDeleteRequest(request, config) {
       });
     }
 
-    await deleteStoredFileRecord(file, config);
-    return new Response(JSON.stringify({ status: 1, message: '删除成功' }), {
+    const deleted = await deleteStoredFileRecord(file, config);
+    return new Response(JSON.stringify({
+      status: 1,
+      message: deleted.failedTelegramMessages.length
+        ? '文件已删除，但部分 Telegram 存储消息未能立即清理'
+        : '删除成功',
+      deletedChunks: deleted.deletedChunkRows,
+      deletedStorageMessages: deleted.deletedStorageMessages,
+      cleanupWarnings: deleted.failedTelegramMessages
+    }), {
       headers: { 'Content-Type': 'application/json' }
     });
   } catch (error) {
@@ -8990,7 +9243,7 @@ function generateAdminPage(fileCards, categoryOptions) {
               const deleteBtn = card.querySelector('.btn-delete');
               const editBtn = card.querySelector('.btn-edit');
               if (shareBtn) {
-                const fileName = getFileName(data.newUrl);
+                const fileName = data.fileName || getFileName(data.newUrl);
                 shareBtn.setAttribute('onclick', 'shareFile("' + data.newUrl + '", "' + fileName + '")');
               }
               if (deleteBtn) {
@@ -9002,8 +9255,11 @@ function generateAdminPage(fileCards, categoryOptions) {
               }
               const fileNameElement = card.querySelector('.file-info div:first-child');
               if (fileNameElement) {
-                const urlObj = new URL(data.newUrl);
-                const fileName = urlObj.pathname.split('/').pop();
+                let fileName = data.fileName;
+                if (!fileName) {
+                  const urlObj = new URL(data.newUrl);
+                  fileName = decodeURIComponent(urlObj.pathname.split('/').pop() || '');
+                }
                 fileNameElement.textContent = fileName;
               }
               const checkbox = card.querySelector('.file-checkbox');
@@ -9035,116 +9291,75 @@ function generateAdminPage(fileCards, categoryOptions) {
 }
 async function handleUpdateSuffixRequest(request, config) {
   try {
-    const { url, suffix } = await request.json();
-    if (!url || !suffix) {
+    const { url, suffix, id } = await request.json();
+    if ((!url && !id) || !String(suffix || '').trim()) {
       return new Response(JSON.stringify({
         status: 0,
-        msg: '文件链接和后缀不能为空'
-      }), { headers: { 'Content-Type': 'application/json' } });
+        msg: '文件标识和新文件名不能为空'
+      }), { status: 400, headers: { 'Content-Type': 'application/json' } });
     }
-    const originalFileName = getFileName(url);
-    let fileRecord = await config.database.prepare('SELECT * FROM files WHERE url = ?')
-      .bind(url).first();
+
+    let fileRecord = null;
+    if (id) {
+      fileRecord = await config.database.prepare(
+        'SELECT * FROM files WHERE id = ?'
+      ).bind(id).first();
+    }
+    if (!fileRecord && url) {
+      fileRecord = await config.database.prepare(
+        'SELECT * FROM files WHERE url = ?'
+      ).bind(url).first();
+    }
+    if (!fileRecord && url) {
+      const path = (() => {
+        try { return decodeURIComponent(new URL(url).pathname.split('/').pop()); }
+        catch (_) { return String(url).split('/').pop(); }
+      })();
+      fileRecord = await config.database.prepare(`
+        SELECT * FROM files
+        WHERE fileId = ? OR file_name = ?
+        ORDER BY id DESC LIMIT 1
+      `).bind(path, path).first();
+    }
     if (!fileRecord) {
-      fileRecord = await config.database.prepare('SELECT * FROM files WHERE fileId = ?')
-        .bind(originalFileName).first();
-      if (!fileRecord) {
-        return new Response(JSON.stringify({
-          status: 0,
-          msg: '未找到对应的文件记录'
-        }), { headers: { 'Content-Type': 'application/json' } });
-      }
-    }
-    const fileExt = originalFileName.split('.').pop();
-    const newFileName = `${suffix}.${fileExt}`;
-    let fileUrl = `https://${config.domain}/${newFileName}`;
-    const existingFile = await config.database.prepare('SELECT * FROM files WHERE fileId = ? AND id != ?')
-      .bind(newFileName, fileRecord.id).first();
-    if (existingFile) {
       return new Response(JSON.stringify({
         status: 0,
-        msg: '后缀已存在，无法修改'
-      }), { headers: { 'Content-Type': 'application/json' } });
+        msg: '未找到对应的文件记录'
+      }), { status: 404, headers: { 'Content-Type': 'application/json' } });
     }
-    const existingUrl = await config.database.prepare('SELECT * FROM files WHERE url = ? AND id != ?')
-      .bind(fileUrl, fileRecord.id).first();
-    if (existingUrl) {
-      return new Response(JSON.stringify({
-        status: 0,
-        msg: '该URL已被使用，请尝试其他后缀'
-      }), { headers: { 'Content-Type': 'application/json' } });
-    }
-    console.log('准备更新文件:', {
-      记录ID: fileRecord.id,
-      原URL: fileRecord.url,
-      原fileId: fileRecord.fileId,
-      存储类型: fileRecord.storage_type,
-      新文件名: newFileName,
-      新URL: fileUrl
-    });
-    if (fileRecord.storage_type === 'telegram') {
-      await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-        .bind(fileUrl, fileRecord.id).run();
-      console.log('Telegram文件更新完成:', {
-        id: fileRecord.id,
-        新URL: fileUrl
-      });
-    } 
-    else if (config.bucket) {
-      try {
-        const fileId = fileRecord.fileId || originalFileName;
-        console.log('尝试从R2获取文件:', fileId);
-        const file = await config.bucket.get(fileId);
-        if (file) {
-          console.log('R2文件存在，正在复制到新名称:', newFileName);
-          const fileData = await file.arrayBuffer();
-          await storeFile(fileData, newFileName, file.httpMetadata.contentType, config);
-          await deleteFile(fileId, config);
-          await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE id = ?')
-            .bind(newFileName, fileUrl, fileRecord.id).run();
-          console.log('R2文件更新完成:', {
-            id: fileRecord.id,
-            新fileId: newFileName,
-            新URL: fileUrl
-          });
-        } else {
-          console.log('R2中未找到文件，只更新URL:', fileId);
-          await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-            .bind(fileUrl, fileRecord.id).run();
-        }
-      } catch (error) {
-        console.error('处理R2文件重命名失败:', error);
-        await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-          .bind(fileUrl, fileRecord.id).run();
-      }
-    } 
-    else {
-      console.log('未知存储类型，只更新URL');
-      await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-        .bind(fileUrl, fileRecord.id).run();
-    }
+
+    const renamed = await renameStoredFileRecord(fileRecord, suffix, config);
     return new Response(JSON.stringify({
       status: 1,
-      msg: '后缀修改成功',
-      newUrl: fileUrl
+      msg: renamed.isChunked
+        ? `文件名修改成功；${renamed.chunkCount} 个分片无需重新上传`
+        : '文件名修改成功',
+      newUrl: renamed.url,
+      fileName: renamed.fileName,
+      isChunked: renamed.isChunked,
+      chunkCount: renamed.chunkCount
     }), { headers: { 'Content-Type': 'application/json' } });
   } catch (error) {
-    console.error('更新后缀失败:', error);
+    console.error('更新文件名失败:', error);
     return new Response(JSON.stringify({
       status: 0,
-      msg: '更新后缀失败: ' + error.message
-    }), { headers: { 'Content-Type': 'application/json' } });
+      msg: '更新文件名失败: ' + error.message
+    }), { status: 400, headers: { 'Content-Type': 'application/json' } });
   }
-} 
+}
 function generateNewUrl(url, suffix, config) {
   const fileName = getFileName(url);
   const newFileName = suffix + '.' + fileName.split('.').pop();
   return `https://${config.domain}/${newFileName}`;
 }
 function getFileName(url) {
-  const urlObj = new URL(url);
-  const pathParts = urlObj.pathname.split('/');
-  return pathParts[pathParts.length - 1];
+  try {
+    const urlObj = new URL(String(url || ''));
+    const pathParts = urlObj.pathname.split('/');
+    return decodeURIComponent(pathParts[pathParts.length - 1] || '');
+  } catch (_) {
+    return String(url || '').split('/').pop() || '';
+  }
 }
 function copyToClipboard(text) {
   navigator.clipboard.writeText(text)
