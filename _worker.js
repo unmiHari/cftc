@@ -418,7 +418,7 @@ async function checkAndAddMissingColumns(config) {
   }
 }
 // 尝试获取该 chat_id 的上传锁，同时分配一个排队序号
-async function acquireUploadLock(chatId, config, maxWaitMs = 20000, pollMs = 300, lockTimeoutMs = 60000) {
+async function acquireUploadLock(chatId, config, maxWaitMs = 20000, pollMs = 300, lockTimeoutMs = 30 * 60 * 1000) {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     const now = Date.now();
@@ -634,6 +634,58 @@ function getWebOwnerChatId(config) {
 
   return '';
 }
+
+function normalizeTelegramApiRoot(value) {
+  const root = String(value || 'https://api.telegram.org').trim();
+  return (root || 'https://api.telegram.org').replace(/\/+$/, '');
+}
+
+function getTelegramApiRoot(config = null) {
+  return normalizeTelegramApiRoot(
+    (config && config.tgApiBaseUrl) ||
+    globalThis.__TG_BOT_API_BASE_URL ||
+    'https://api.telegram.org'
+  );
+}
+
+function getTelegramFileRoot(config = null) {
+  return normalizeTelegramApiRoot(
+    (config && config.tgFileBaseUrl) ||
+    globalThis.__TG_BOT_FILE_BASE_URL ||
+    getTelegramApiRoot(config)
+  );
+}
+
+function telegramMethodUrl(botToken, method, config = null) {
+  return `${getTelegramApiRoot(config)}/bot${botToken}/${String(method || '').replace(/^\/+/, '')}`;
+}
+
+function telegramFileDownloadUrl(botToken, filePath, config = null) {
+  const path = String(filePath || '').replace(/^\/+/, '');
+  return `${getTelegramFileRoot(config)}/file/bot${botToken}/${path}`;
+}
+
+async function fetchTelegramBinaryFile(
+  fileId,
+  filePath,
+  config,
+  requestHeaders = null
+) {
+  const headers = new Headers(requestHeaders || undefined);
+  if (config && config.tgFileProxyUrl) {
+    const proxyUrl = new URL(config.tgFileProxyUrl);
+    proxyUrl.searchParams.set('file_id', String(fileId || ''));
+    if (config.tgFileProxySecret) {
+      headers.set('X-Telegram-File-Proxy-Secret', config.tgFileProxySecret);
+    }
+    return fetch(proxyUrl.toString(), { headers });
+  }
+  return fetch(
+    telegramFileDownloadUrl(config.tgBotToken, filePath, config),
+    { headers }
+  );
+}
+
 async function setWebhook(webhookUrl, botToken) {
   if (!botToken) {
     console.log('未配置Telegram机器人令牌，跳过webhook设置');
@@ -645,7 +697,7 @@ async function setWebhook(webhookUrl, botToken) {
     try {
       console.log(`尝试设置webhook: ${webhookUrl}`);
       const response = await fetch(
-        `https://api.telegram.org/bot${botToken}/setWebhook?url=${webhookUrl}`
+        `${telegramMethodUrl(botToken, 'setWebhook')}?url=${encodeURIComponent(webhookUrl)}`
       );
       if (!response.ok) {
         const errorText = await response.text();
@@ -681,11 +733,28 @@ async function setWebhook(webhookUrl, botToken) {
   return false;
 }
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, executionCtx) {
     if (!env.DATABASE) {
       console.error("缺少DATABASE配置");
       return new Response('缺少必要配置: DATABASE 环境变量未设置', { status: 500 });
     }
+    const tgApiBaseUrl = normalizeTelegramApiRoot(
+      env.TG_BOT_API_BASE_URL || 'https://api.telegram.org'
+    );
+    const tgFileBaseUrl = normalizeTelegramApiRoot(
+      env.TG_BOT_FILE_BASE_URL || tgApiBaseUrl
+    );
+    const useLocalBotApi =
+      String(env.TG_LOCAL_BOT_API || '').toLowerCase() === 'true' ||
+      tgApiBaseUrl !== 'https://api.telegram.org';
+    const tgFileProxyUrl = String(env.TG_FILE_PROXY_URL || '').trim();
+    const allowLargeBotDownloads =
+      useLocalBotApi &&
+      (
+        Boolean(tgFileProxyUrl) ||
+        String(env.TG_LOCAL_FILE_ENDPOINT || '').toLowerCase() === 'true'
+      );
+
     const config = {
       domain: env.DOMAIN || request.headers.get("host") || '',
       database: env.DATABASE,
@@ -693,14 +762,22 @@ export default {
       password: env.PASSWORD || '',
       enableAuth: env.ENABLE_AUTH === 'true' || false,
       tgBotToken: env.TG_BOT_TOKEN || '',
+      tgApiBaseUrl,
+      tgFileBaseUrl,
+      tgFileProxyUrl,
+      tgFileProxySecret: String(env.TG_FILE_PROXY_SECRET || ''),
+      useLocalBotApi,
+      allowLargeBotDownloads,
       tgAdminId: normalizeIdList(env.TG_ADMIN_ID),
       tgStorageChatId: String(env.TG_STORAGE_CHAT_ID || '').trim(),
       cookie: Number(env.COOKIE) || 7,
       // MAX_SIZE_MB 是业务总上限；Telegram 单片上限由下面几项单独控制
       maxSizeMB: Number(env.MAX_SIZE_MB) || 1024,
       telegramPhotoLimitMB: 10,
-      telegramFileLimitMB: 50,
-      telegramDownloadLimitMB: 20,
+      telegramFileLimitMB: Number(env.TG_FILE_LIMIT_MB) || (useLocalBotApi ? 2000 : 50),
+      telegramDownloadLimitMB: allowLargeBotDownloads
+        ? Number(env.TG_LOCAL_DOWNLOAD_LIMIT_MB) || 2000
+        : 20,
       // 公开 Bot API 的 getFile 下载上限仍为 20MB，因此分片必须低于 20MB
       telegramChunkSizeMB: Math.min(19, Math.max(1, Number(env.TG_CHUNK_SIZE_MB) || 19)),
       bucket: env.BUCKET,
@@ -714,6 +791,10 @@ export default {
       notificationCacheTTL: 3600000,
       lastNotificationFetch: 0
     };
+
+    // 兼容仍只接收 botToken 的旧辅助函数；同一 Worker 环境使用同一套 Telegram 端点。
+    globalThis.__TG_BOT_API_BASE_URL = config.tgApiBaseUrl;
+    globalThis.__TG_BOT_FILE_BASE_URL = config.tgFileBaseUrl;
     if (config.enableAuth && (!config.username || !config.password)) {
         console.error("启用了认证但未配置用户名或密码");
         return new Response('认证配置错误: 缺少USERNAME或PASSWORD环境变量', { status: 500 });
@@ -874,7 +955,9 @@ export default {
             telegramPhotoLimitMB: config.telegramPhotoLimitMB,
             telegramFileLimitMB: config.telegramFileLimitMB,
             telegramDownloadLimitMB: config.telegramDownloadLimitMB,
-            telegramChunkSizeMB: config.telegramChunkSizeMB
+            telegramChunkSizeMB: config.telegramChunkSizeMB,
+            useLocalBotApi: config.useLocalBotApi,
+            allowLargeBotDownloads: config.allowLargeBotDownloads
           };
           return new Response(JSON.stringify(safeConfig), {
               headers: { 
@@ -885,7 +968,7 @@ export default {
       },
       '/webhook': () => { 
           console.log('[Route] Handling /webhook request.');
-          return handleTelegramWebhook(request, config); 
+          return handleTelegramWebhook(request, config, executionCtx); 
       },
       '/bing': () => { 
           console.log('[Route] Handling /bing request.');
@@ -912,7 +995,7 @@ export default {
     return await handleFileRequest(request, config);
   }
 };
-async function handleTelegramWebhook(request, config) {
+async function handleTelegramWebhook(request, config, executionCtx = null) {
   try {
     const update = await request.json();
     let chatId;
@@ -1446,16 +1529,31 @@ async function handleTelegramWebhook(request, config) {
           isDocument = false;
         }
         if (file) {
-          const gotLock = await acquireUploadLock(chatId, config);
-          if (!gotLock) {
-            await sendMessage(chatId, "⏳ 有其他文件正在处理中，请稍后重试或稍等片刻", config.tgBotToken);
+          const processMediaUpload = async () => {
+            const gotLock = await acquireUploadLock(chatId, config);
+            if (!gotLock) {
+              await sendMessage(chatId, "⏳ 有其他文件正在处理中，请稍后重试或稍等片刻", config.tgBotToken);
+              return;
+            }
+            try {
+              await handleMediaUpload(
+                chatId,
+                file,
+                isDocument,
+                config,
+                userSetting,
+                update.message.message_id
+              );
+            } finally {
+              await releaseUploadLock(chatId, config);
+            }
+          };
+
+          if (executionCtx && typeof executionCtx.waitUntil === 'function') {
+            executionCtx.waitUntil(processMediaUpload());
             return new Response('OK');
           }
-          try {
-            await handleMediaUpload(chatId, file, isDocument, config, userSetting);
-          } finally {
-            await releaseUploadLock(chatId, config); // 无论成功失败都要释放锁，避免后续文件永远卡住
-          }
+          await processMediaUpload();
         } else {
           await sendMessage(chatId, "❌ 无法识别的文件类型", config.tgBotToken);
         }
@@ -1471,16 +1569,31 @@ async function handleTelegramWebhook(request, config) {
         }
         if (fileField) {
           console.log(`找到未明确处理的文件类型: ${fileField}`, JSON.stringify(message[fileField]));
-          const gotLock = await acquireUploadLock(chatId, config);
-          if (!gotLock) {
-            await sendMessage(chatId, "⏳ 有其他文件正在处理中，请稍后重试", config.tgBotToken);
+          const processUnknownMediaUpload = async () => {
+            const gotLock = await acquireUploadLock(chatId, config);
+            if (!gotLock) {
+              await sendMessage(chatId, "⏳ 有其他文件正在处理中，请稍后重试", config.tgBotToken);
+              return;
+            }
+            try {
+              await handleMediaUpload(
+                chatId,
+                message[fileField],
+                true,
+                config,
+                userSetting,
+                update.message.message_id
+              );
+            } finally {
+              await releaseUploadLock(chatId, config);
+            }
+          };
+
+          if (executionCtx && typeof executionCtx.waitUntil === 'function') {
+            executionCtx.waitUntil(processUnknownMediaUpload());
             return new Response('OK');
           }
-          try {
-            await handleMediaUpload(chatId, message[fileField], true, config, userSetting);
-          } finally {
-            await releaseUploadLock(chatId, config);
-          }
+          await processUnknownMediaUpload();
         } else if (userSetting.waiting_for === 'edit_suffix_input_file' && message.text) {
           try {
             const userInput = message.text.trim();
@@ -1626,7 +1739,7 @@ async function sendPanel(chatId, userSetting, config) {
       const cachedData = config.menuCache.get(cacheKey);
       if (Date.now() - cachedData.timestamp < config.menuCacheTTL) {
         console.log(`使用缓存的菜单: ${cacheKey}`);
-        const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+        const response = await fetch(telegramMethodUrl(config.tgBotToken, 'sendMessage', config), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: cachedData.menuData
@@ -1654,7 +1767,7 @@ async function sendPanel(chatId, userSetting, config) {
         timestamp: Date.now()
       });
     }
-    const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+    const response = await fetch(telegramMethodUrl(config.tgBotToken, 'sendMessage', config), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: menuData
@@ -1852,7 +1965,7 @@ async function findFileRecord(rawInput, chatId, config) {
 async function handleCallbackQuery(update, config, userSetting) {
   const chatId = update.callback_query.from.id.toString();
   const cbData = update.callback_query.data;
-  const answerPromise = fetch(`https://api.telegram.org/bot${config.tgBotToken}/answerCallbackQuery`, {
+  const answerPromise = fetch(telegramMethodUrl(config.tgBotToken, 'answerCallbackQuery', config), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ callback_query_id: update.callback_query.id })
@@ -1961,7 +2074,7 @@ async function handleCallbackQuery(update, config, userSetting) {
           await sendPanel(chatId, userSetting, config);
         }
         if (cachedData.replyMarkup) {
-          await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+          await fetch(telegramMethodUrl(config.tgBotToken, 'sendMessage', config), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -2117,7 +2230,7 @@ async function handleCallbackQuery(update, config, userSetting) {
       );
     
       await fetch(
-        `https://api.telegram.org/bot${config.tgBotToken}/sendMessage`,
+        telegramMethodUrl(config.tgBotToken, 'sendMessage', config),
         {
           method: 'POST',
           headers: {
@@ -2230,7 +2343,7 @@ async function handleCallbackQuery(update, config, userSetting) {
         });
       }
       
-      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+      await fetch(telegramMethodUrl(config.tgBotToken, 'sendMessage', config), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2425,7 +2538,7 @@ async function handleCallbackQuery(update, config, userSetting) {
           return [{ text: fileName, callback_data: `edit_suffix_file_${file.id}` }];
         }).concat([[{ text: "« 返回", callback_data: "back_to_panel" }]])
       };
-      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+      await fetch(telegramMethodUrl(config.tgBotToken, 'sendMessage', config), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2472,7 +2585,7 @@ async function handleCallbackQuery(update, config, userSetting) {
            disablePreview: true
          });
       }
-      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+      await fetch(telegramMethodUrl(config.tgBotToken, 'sendMessage', config), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2638,7 +2751,7 @@ async function uploadBlobToTelegram(
   }
 
   const response = await fetch(
-    `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
+    telegramMethodUrl(config.tgBotToken, method, config),
     { method: 'POST', body: formData }
   );
   const responseText = await response.text();
@@ -2685,7 +2798,7 @@ async function deleteTelegramStorageMessage(messageId, config) {
   if (!messageId || Number(messageId) <= 0 || !config.tgStorageChatId) return true;
   try {
     const response = await fetch(
-      `https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`,
+      telegramMethodUrl(config.tgBotToken, 'deleteMessage', config),
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3025,18 +3138,22 @@ async function getTelegramFileResponse(fileId, config, rangeStart = null, rangeE
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const infoResponse = await fetch(
-        `https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${encodeURIComponent(fileId)}`
+        `${telegramMethodUrl(config.tgBotToken, 'getFile', config)}?file_id=${encodeURIComponent(fileId)}`
       );
       const info = await infoResponse.json();
       if (!infoResponse.ok || !info.ok || !info.result || !info.result.file_path) {
         throw new Error(info.description || `getFile HTTP ${infoResponse.status}`);
       }
-      const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${info.result.file_path}`;
       const headers = new Headers();
       if (rangeStart !== null && rangeEnd !== null) {
         headers.set('Range', `bytes=${rangeStart}-${rangeEnd}`);
       }
-      const fileResponse = await fetch(telegramUrl, { headers });
+      const fileResponse = await fetchTelegramBinaryFile(
+        fileId,
+        info.result.file_path,
+        config,
+        headers
+      );
       if (!fileResponse.ok && fileResponse.status !== 206) {
         throw new Error(`文件下载 HTTP ${fileResponse.status}`);
       }
@@ -3210,64 +3327,445 @@ async function deleteStoredFileRecord(file, config) {
   return true;
 }
 
-async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
+
+function buildBotUploadId(chatId, sourceMessageId, file) {
+  const uniquePart = String(
+    (file && (file.file_unique_id || file.file_id)) || crypto.randomUUID()
+  ).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const raw = `bot_${chatId}_${sourceMessageId || Date.now()}_${uniquePart}`;
+  return raw.slice(0, 80).padEnd(16, '_');
+}
+
+function buildProgressBar(percent, width = 12) {
+  const normalized = Math.max(0, Math.min(100, Number(percent || 0)));
+  const filled = Math.round((normalized / 100) * width);
+  return '█'.repeat(filled) + '░'.repeat(Math.max(0, width - filled));
+}
+
+function formatDuration(seconds) {
+  const value = Math.max(0, Math.round(Number(seconds || 0)));
+  if (value < 60) return `${value} 秒`;
+  const minutes = Math.floor(value / 60);
+  const remain = value % 60;
+  return remain ? `${minutes} 分 ${remain} 秒` : `${minutes} 分钟`;
+}
+
+async function editTelegramTextMessage(chatId, messageId, text, config, replyMarkup = null) {
+  if (!messageId) return false;
+  const body = {
+    chat_id: chatId,
+    message_id: Number(messageId),
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true
+  };
+  if (replyMarkup) body.reply_markup = replyMarkup;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch(
+        telegramMethodUrl(config.tgBotToken, 'editMessageText', config),
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        }
+      );
+      const data = await response.json().catch(() => null);
+      if (response.ok && data && data.ok) return true;
+      const description = data && data.description ? data.description : '';
+      if (/message is not modified/i.test(description)) return true;
+      if (data && Number(data.error_code) === 429 && attempt < 3) {
+        const retryAfter = Number(data.parameters && data.parameters.retry_after) || 1;
+        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+        continue;
+      }
+      console.warn('编辑 Telegram 进度消息失败:', description || response.status);
+      return false;
+    } catch (error) {
+      if (attempt >= 3) {
+        console.warn('编辑 Telegram 进度消息出错:', error.message);
+        return false;
+      }
+      await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+    }
+  }
+  return false;
+}
+
+function createUploadProgressUpdater(chatId, messageId, fileName, totalBytes, config) {
+  const startedAt = Date.now();
+  let lastEditAt = 0;
+  let lastText = '';
+
+  return async function updateProgress({
+    phase = '准备中',
+    processedBytes = 0,
+    completedChunks = 0,
+    totalChunks = 0,
+    force = false,
+    finalUrl = '',
+    error = ''
+  } = {}) {
+    const now = Date.now();
+    const total = Math.max(0, Number(totalBytes || 0));
+    const processed = Math.max(0, Math.min(total || Number.MAX_SAFE_INTEGER, Number(processedBytes || 0)));
+    const percent = total > 0 ? Math.min(100, (processed / total) * 100) : 0;
+    const elapsedSeconds = Math.max(0.001, (now - startedAt) / 1000);
+    const speed = processed / elapsedSeconds;
+    const remainingSeconds = speed > 0 && total > processed
+      ? (total - processed) / speed
+      : 0;
+
+    let text;
+    if (error) {
+      text = `❌ <b>上传失败</b>\n\n` +
+        `📄 ${escapeHtml(fileName)}\n` +
+        `⚠️ ${escapeHtml(error)}`;
+    } else if (finalUrl) {
+      text = `✅ <b>上传完成</b>\n\n` +
+        `📄 ${escapeHtml(fileName)}\n` +
+        `📦 ${formatSize(total)}\n` +
+        (totalChunks > 1 ? `🧩 ${totalChunks} 个分片\n` : '') +
+        `🔗 ${escapeHtml(finalUrl)}`;
+    } else {
+      text = `⏳ <b>${escapeHtml(phase)}</b>\n\n` +
+        `📄 ${escapeHtml(fileName)}\n` +
+        `${buildProgressBar(percent)} ${percent.toFixed(1)}%\n` +
+        `📦 ${formatSize(processed)} / ${formatSize(total)}\n` +
+        (totalChunks > 0 ? `🧩 ${completedChunks}/${totalChunks} 分片\n` : '') +
+        `🚀 ${formatSize(speed)}/s` +
+        (remainingSeconds > 0 ? `\n⏱ 预计剩余 ${formatDuration(remainingSeconds)}` : '');
+    }
+
+    if (!force && now - lastEditAt < 1200) return false;
+    if (!force && text === lastText) return false;
+    lastEditAt = now;
+    lastText = text;
+    return editTelegramTextMessage(chatId, messageId, text, config);
+  };
+}
+
+function combineUint8Arrays(parts, totalLength) {
+  const output = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.byteLength;
+  }
+  return output;
+}
+
+async function* splitResponseBodyIntoBlobs(response, chunkSize, mimeType, onRead) {
+  if (!response.body) {
+    const buffer = new Uint8Array(await response.arrayBuffer());
+    if (onRead) await onRead(buffer.byteLength);
+    for (let offset = 0; offset < buffer.byteLength; offset += chunkSize) {
+      yield new Blob([buffer.subarray(offset, Math.min(offset + chunkSize, buffer.byteLength))], {
+        type: mimeType || 'application/octet-stream'
+      });
+    }
+    return;
+  }
+
+  const reader = response.body.getReader();
+  let parts = [];
+  let partLength = 0;
+  let totalRead = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      let offset = 0;
+      while (offset < value.byteLength) {
+        const take = Math.min(chunkSize - partLength, value.byteLength - offset);
+        parts.push(value.subarray(offset, offset + take));
+        partLength += take;
+        offset += take;
+        totalRead += take;
+        if (onRead) await onRead(totalRead);
+
+        if (partLength === chunkSize) {
+          yield new Blob([combineUint8Arrays(parts, partLength)], {
+            type: mimeType || 'application/octet-stream'
+          });
+          parts = [];
+          partLength = 0;
+        }
+      }
+    }
+    if (partLength > 0) {
+      yield new Blob([combineUint8Arrays(parts, partLength)], {
+        type: mimeType || 'application/octet-stream'
+      });
+    }
+  } finally {
+    try { reader.releaseLock(); } catch (_) {}
+  }
+}
+
+async function saveTelegramFileFromResponse({
+  response,
+  uploadId,
+  fileName,
+  fileSize,
+  mimeType,
+  categoryId,
+  chatId,
+  key,
+  progress
+}, config) {
+  const chunkSize = getTelegramChunkSizeBytes(config);
+  const totalChunks = Math.max(1, Math.ceil(Number(fileSize) / chunkSize));
+  const finalKey = key || generateSafeKey(fileName);
+  const finalUrl = `https://${config.domain}/${finalKey}`;
+
+  const existingFile = await config.database.prepare(`
+    SELECT * FROM files WHERE upload_id = ? AND chat_id = ? LIMIT 1
+  `).bind(uploadId, chatId).first();
+  if (existingFile) {
+    return {
+      url: existingFile.url,
+      isChunked: Number(existingFile.is_chunked || 0) === 1,
+      chunkCount: Number(existingFile.chunk_count || 0)
+    };
+  }
+
+  let uploadedBytes = 0;
+  let chunkIndex = 0;
+  try {
+    for await (const chunk of splitResponseBodyIntoBlobs(
+      response,
+      chunkSize,
+      mimeType,
+      async totalRead => {
+        if (progress) {
+          await progress({
+            phase: `读取并切分第 ${Math.min(chunkIndex + 1, totalChunks)}/${totalChunks} 片`,
+            processedBytes: Math.max(uploadedBytes, totalRead),
+            completedChunks: chunkIndex,
+            totalChunks
+          });
+        }
+      }
+    )) {
+      if (totalChunks === 1) {
+        if (progress) {
+          await progress({
+            phase: '正在写入 Telegram 存储',
+            processedBytes: chunk.size,
+            completedChunks: 0,
+            totalChunks: 1,
+            force: true
+          });
+        }
+        // 机器人收到的原文件必须按 document 保存，避免 sendPhoto 重新压缩图片。
+        const uploaded = await uploadBlobToTelegram(
+          chunk,
+          fileName,
+          mimeType,
+          config,
+          {
+            method: 'sendDocument',
+            field: 'document',
+            caption: `File: ${sanitizeTelegramFileName(fileName)}\nSize: ${formatSize(fileSize)}`
+          }
+        );
+        await insertFileRecord({
+          url: finalUrl,
+          fileId: uploaded.fileId,
+          messageId: uploaded.messageId,
+          fileName,
+          fileSize,
+          mimeType,
+          storageType: 'telegram',
+          categoryId,
+          chatId,
+          isChunked: false,
+          chunkCount: 0,
+          uploadId
+        }, config);
+        return { url: finalUrl, isChunked: false, chunkCount: 0 };
+      }
+
+      if (progress) {
+        await progress({
+          phase: `正在上传第 ${chunkIndex + 1}/${totalChunks} 片`,
+          processedBytes: Math.max(uploadedBytes, Math.min(fileSize, uploadedBytes + chunk.size)),
+          completedChunks: chunkIndex,
+          totalChunks
+        });
+      }
+      await uploadOneTelegramChunk(
+        chunk,
+        uploadId,
+        chunkIndex,
+        totalChunks,
+        fileName,
+        chatId,
+        config
+      );
+      uploadedBytes += chunk.size;
+      chunkIndex++;
+      if (progress) {
+        await progress({
+          phase: '分片上传中',
+          processedBytes: uploadedBytes,
+          completedChunks: chunkIndex,
+          totalChunks,
+          force: true
+        });
+      }
+    }
+
+    if (chunkIndex !== totalChunks) {
+      throw new Error(`分片数量不一致：预计 ${totalChunks}，实际 ${chunkIndex}`);
+    }
+
+    if (progress) {
+      await progress({
+        phase: '正在生成分片清单',
+        processedBytes: fileSize,
+        completedChunks: totalChunks,
+        totalChunks,
+        force: true
+      });
+    }
+    const fileRow = await finalizeChunkedTelegramUpload({
+      uploadId,
+      chatId,
+      fileName,
+      fileSize,
+      mimeType,
+      categoryId,
+      key: finalKey,
+      totalChunks
+    }, config);
+    return { url: fileRow.url, isChunked: true, chunkCount: totalChunks };
+  } catch (error) {
+    await abortPendingChunkUpload(uploadId, chatId, config);
+    throw error;
+  }
+}
+
+async function handleMediaUpload(
+  chatId,
+  file,
+  isDocument,
+  config,
+  userSetting,
+  sourceMessageId = null
+) {
+  const declaredSize = Number(file && file.file_size || 0);
+  let fileName = sanitizeTelegramFileName(
+    file && file.file_name,
+    `telegram_${sourceMessageId || Date.now()}.bin`
+  );
   const processingMessage = await sendMessage(
     chatId,
-    '⏳ 正在处理您的文件，请稍候...',
+    `⏳ <b>准备上传</b>\n\n📄 ${escapeHtml(fileName)}\n${buildProgressBar(0)} 0.0%`,
     config.tgBotToken
   );
   const processingMessageId = processingMessage && processingMessage.result
     ? processingMessage.result.message_id
     : null;
 
+  const uploadId = buildBotUploadId(chatId, sourceMessageId, file);
+  let progress = createUploadProgressUpdater(
+    chatId,
+    processingMessageId,
+    fileName,
+    declaredSize,
+    config
+  );
+
   try {
-    const declaredSize = Number(file.file_size || 0);
-    const botDownloadLimit = Number(config.telegramDownloadLimitMB || 20) * 1024 * 1024;
-    if (declaredSize > botDownloadLimit) {
-      throw new Error(
-        `Telegram 云端 Bot API 只能通过 getFile 下载不超过 ${config.telegramDownloadLimitMB}MB 的文件` +
-        '请改用网页上传，大文件会自动分片'
-      );
-    }
+    if (!file || !file.file_id) throw new Error('消息中没有有效的 Telegram file_id');
     if (declaredSize > Number(config.maxSizeMB) * 1024 * 1024) {
-      throw new Error(`文件超过${config.maxSizeMB}MB限制`);
+      throw new Error(`文件超过 ${config.maxSizeMB}MB 业务限制`);
     }
 
+    const cloudDownloadLimit = 20 * 1024 * 1024;
+    if (!config.allowLargeBotDownloads && declaredSize > cloudDownloadLimit) {
+      throw new Error(
+        `官方云端 Bot API 的 getFile 只能下载不超过 20MB 的文件。` +
+        `请配置本地 Bot API Server，并设置 TG_FILE_PROXY_URL（或确认本地文件端点可直接访问）`
+      );
+    }
+
+    const existingFile = await config.database.prepare(`
+      SELECT * FROM files WHERE upload_id = ? AND chat_id = ? LIMIT 1
+    `).bind(uploadId, chatId).first();
+    if (existingFile) {
+      const existingChunks = Number(existingFile.chunk_count || 0);
+      await progress({
+        processedBytes: Number(existingFile.file_size || declaredSize),
+        completedChunks: existingChunks,
+        totalChunks: Math.max(1, existingChunks),
+        finalUrl: existingFile.url,
+        force: true
+      });
+      return;
+    }
+
+    await progress({ phase: '正在获取 Telegram 文件信息', force: true });
     const fileInfoResponse = await fetch(
-      `https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${encodeURIComponent(file.file_id)}`
+      `${telegramMethodUrl(config.tgBotToken, 'getFile', config)}?file_id=${encodeURIComponent(file.file_id)}`
     );
-    const data = await fileInfoResponse.json();
-    if (!fileInfoResponse.ok || !data.ok || !data.result || !data.result.file_path) {
-      throw new Error(`获取文件路径失败: ${data.description || JSON.stringify(data)}`);
+    const data = await fileInfoResponse.json().catch(() => null);
+    if (!fileInfoResponse.ok || !data || !data.ok || !data.result || !data.result.file_path) {
+      throw new Error(`获取文件路径失败: ${(data && data.description) || fileInfoResponse.status}`);
     }
 
     const actualSize = Number(data.result.file_size || declaredSize || 0);
-    if (actualSize > botDownloadLimit) {
+    if (!actualSize) throw new Error('Telegram 未返回有效文件大小');
+    if (!config.allowLargeBotDownloads && actualSize > cloudDownloadLimit) {
       throw new Error(
-        `文件为 ${formatSize(actualSize)}，超过 Telegram Bot API 的 ${config.telegramDownloadLimitMB}MB 下载限制` +
-        '请使用网页分片上传'
+        `文件为 ${formatSize(actualSize)}，超过官方云端 Bot API 的 20MB 下载限制；` +
+        `请启用本地 Bot API Server 和文件代理`
       );
     }
     if (actualSize > Number(config.maxSizeMB) * 1024 * 1024) {
-      throw new Error(`文件超过${config.maxSizeMB}MB限制`);
+      throw new Error(`文件超过 ${config.maxSizeMB}MB 业务限制`);
     }
 
-    if (processingMessageId) {
-      fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          message_id: processingMessageId,
-          text: '⏳ 文件已接收，正在写入存储...'
-        })
-      }).catch(error => console.error('更新处理消息失败:', error));
+    let mimeType = file.mime_type || 'application/octet-stream';
+    const filePath = data.result.file_path;
+    const filePathExt = (String(filePath).split('.').pop() || '').toLowerCase();
+    let ext = fileName.includes('.')
+      ? (fileName.split('.').pop() || '').toLowerCase()
+      : filePathExt;
+    if (!ext) ext = getExtensionFromMime(mimeType);
+    if (!file.file_name) fileName = `file_${Date.now()}.${ext || 'bin'}`;
+    if (!mimeType || mimeType === 'application/octet-stream') {
+      mimeType = getContentType(ext || 'bin');
     }
 
-    let categoryId = userSetting && userSetting.current_category_id
-      ? userSetting.current_category_id
-      : null;
-    if (!categoryId) {
+    progress = createUploadProgressUpdater(
+      chatId,
+      processingMessageId,
+      fileName,
+      actualSize,
+      config
+    );
+    await progress({ phase: '正在下载并准备分片', force: true });
+
+    const fileResponse = await fetchTelegramBinaryFile(
+      file.file_id,
+      filePath,
+      config
+    );
+    if (!fileResponse.ok) {
+      throw new Error(`获取文件内容失败: HTTP ${fileResponse.status}`);
+    }
+
+    const storageType = userSetting && userSetting.storage_type
+      ? userSetting.storage_type
+      : 'telegram';
+    const categoryId = await (async () => {
+      if (userSetting && userSetting.current_category_id) {
+        return userSetting.current_category_id;
+      }
       let defaultCategory = await config.database.prepare(
         'SELECT id FROM categories WHERE name = ?'
       ).bind('默认分类').first();
@@ -3277,95 +3775,90 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
         ).bind('默认分类', Date.now()).run();
         defaultCategory = { id: result.meta && result.meta.last_row_id };
       }
-      categoryId = defaultCategory && defaultCategory.id;
-    }
+      return defaultCategory && defaultCategory.id;
+    })();
 
-    const filePath = data.result.file_path;
-    const fileUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${filePath}`;
-    const fileResponse = await fetch(fileUrl);
-    if (!fileResponse.ok) {
-      throw new Error(`获取文件内容失败: ${fileResponse.status} ${fileResponse.statusText}`);
-    }
-
-    let mimeType = file.mime_type || fileResponse.headers.get('content-type') || 'application/octet-stream';
-    const filePathExt = (filePath.split('.').pop() || '').toLowerCase();
-    let fileName = file.file_name || '';
-    let ext = fileName.includes('.')
-      ? (fileName.split('.').pop() || '').toLowerCase()
-      : filePathExt;
-    if (!ext) ext = getExtensionFromMime(mimeType);
-    if (!fileName) fileName = `file_${Date.now()}.${ext || 'bin'}`;
-    if (!mimeType || mimeType === 'application/octet-stream') {
-      mimeType = getContentType(ext || 'bin');
-    }
-
-    const blob = new Blob([await fileResponse.arrayBuffer()], { type: mimeType });
-    const storageType = userSetting && userSetting.storage_type
-      ? userSetting.storage_type
-      : 'telegram';
     const key = generateSafeKey(fileName);
-    let finalUrl;
-
+    let saved;
     if (storageType === 'r2' && config.bucket) {
-      await config.bucket.put(key, blob, { httpMetadata: { contentType: mimeType } });
-      finalUrl = `https://${config.domain}/${key}`;
+      await progress({
+        phase: '正在读取文件并写入 R2',
+        processedBytes: Math.min(actualSize, Math.floor(actualSize * 0.25)),
+        totalChunks: 1,
+        completedChunks: 0,
+        force: true
+      });
+      // 保持与原版兼容：R2 路径仍使用 ArrayBuffer，避免未知长度流被 R2 拒绝。
+      const r2Buffer = await fileResponse.arrayBuffer();
+      await progress({
+        phase: '正在写入 R2 存储',
+        processedBytes: actualSize,
+        totalChunks: 1,
+        completedChunks: 0,
+        force: true
+      });
+      await config.bucket.put(key, r2Buffer, {
+        httpMetadata: { contentType: mimeType }
+      });
+      const finalUrl = `https://${config.domain}/${key}`;
       await insertFileRecord({
         url: finalUrl,
         fileId: key,
         messageId: -1,
         fileName,
-        fileSize: actualSize || blob.size,
+        fileSize: actualSize,
         mimeType,
         storageType: 'r2',
         categoryId,
         chatId,
-        isChunked: false
+        isChunked: false,
+        chunkCount: 0,
+        uploadId
       }, config);
+      saved = { url: finalUrl, isChunked: false, chunkCount: 0 };
     } else {
-      const saved = await saveTelegramFileFromBlob({
-        blob,
+      saved = await saveTelegramFileFromResponse({
+        response: fileResponse,
+        uploadId,
         fileName,
-        fileSize: actualSize || blob.size,
+        fileSize: actualSize,
         mimeType,
         categoryId,
         chatId,
-        key
+        key,
+        progress
       }, config);
-      finalUrl = saved.url;
     }
 
-    if (processingMessageId) {
-      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, message_id: processingMessageId })
-      }).catch(error => console.error('删除处理消息失败:', error));
-    }
+    await progress({
+      processedBytes: actualSize,
+      completedChunks: saved.chunkCount || 1,
+      totalChunks: saved.chunkCount || 1,
+      finalUrl: saved.url,
+      force: true
+    });
 
-    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(finalUrl)}`;
-    await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendPhoto`, {
+    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(saved.url)}`;
+    await fetch(telegramMethodUrl(config.tgBotToken, 'sendPhoto', config), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: chatId,
         photo: qrCodeUrl,
-        caption: `✅ 文件上传成功\n\n📝 图床直链：\n${finalUrl}\n\n🔍 扫描上方二维码快速访问`
+        caption: `🔍 扫描二维码访问\n${saved.url}`
       })
-    });
+    }).catch(error => console.warn('发送二维码失败:', error.message));
   } catch (error) {
     console.error('Error handling media upload:', error);
-    if (processingMessageId) {
-      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, message_id: processingMessageId })
-      }).catch(deleteError => console.error('删除处理消息失败:', deleteError));
+    const edited = await progress({ error: error.message, force: true });
+    if (!edited) {
+      await sendMessage(chatId, `❌ 上传失败: ${escapeHtml(error.message)}`, config.tgBotToken);
     }
-    await sendMessage(chatId, `❌ 上传失败: ${error.message}`, config.tgBotToken);
   }
 }
+
 async function getTelegramFileUrl(fileId, botToken, config) {
-  const response = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
+  const response = await fetch(`${telegramMethodUrl(botToken, 'getFile', config)}?file_id=${encodeURIComponent(fileId)}`);
   const data = await response.json();
   if (!data.ok) throw new Error('获取文件路径失败');
   const filePath = data.result.file_path;
@@ -3376,7 +3869,7 @@ async function getTelegramFileUrl(fileId, botToken, config) {
   if (config && config.domain) {
     return `https://${config.domain}/${newFileName}`;
   } else {
-    return `https://api.telegram.org/file/bot${botToken}/${filePath}`;
+    return telegramFileDownloadUrl(botToken, filePath, config);
   }
 }
 function authenticate(request, config) {
@@ -4543,7 +5036,7 @@ async function sendMessage(
     }
 
     const response = await fetch(
-      `https://api.telegram.org/bot${botToken}/sendMessage`,
+      telegramMethodUrl(botToken, 'sendMessage'),
       {
         method: 'POST',
         headers: {
@@ -4674,7 +5167,7 @@ async function deleteTelegramMessage(
 
   try {
     const response = await fetch(
-      `https://api.telegram.org/bot${botToken}/deleteMessage`,
+      telegramMethodUrl(botToken, 'deleteMessage'),
       {
         method: 'POST',
         headers: {
@@ -7513,7 +8006,7 @@ async function storeFileInTelegram(arrayBuffer, fileName, mimeType, config) {
   const formData = new FormData();
   const blob = new Blob([arrayBuffer], { type: mimeType || 'application/octet-stream' });
   formData.append('document', blob, fileName);
-  const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendDocument?chat_id=${config.tgStorageChatId}`, {
+  const response = await fetch(`${telegramMethodUrl(config.tgBotToken, 'sendDocument', config)}?chat_id=${encodeURIComponent(config.tgStorageChatId)}`, {
     method: 'POST',
     body: formData
   });
