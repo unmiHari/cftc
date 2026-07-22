@@ -99,7 +99,7 @@ async function recreateAllTables(config) {
       )
     `).run();
 
-    // 分片先以 upload_id 暂存；完成后再绑定 files.id。
+    // 分片先以 upload_id 暂存；完成后再绑定 files.id
     await config.database.prepare(`
       CREATE TABLE IF NOT EXISTS file_chunks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -464,10 +464,10 @@ async function ensureColumnExists(config, tableName, columnName, columnType) {
       console.warn(`添加列 ${columnName} 到 ${tableName} 时发生错误: ${alterError.message}. 尝试再次检查列是否存在...`, alterError); 
       const tableInfoAfterAttempt = await config.database.prepare(`PRAGMA table_info(${tableName})`).all();
       if (tableInfoAfterAttempt.results.some(col => col.name === columnName)) {
-         console.log(`列 ${columnName} 在添加尝试失败后被发现存在于表 ${tableName} 中。`);
+         console.log(`列 ${columnName} 在添加尝试失败后被发现存在于表 ${tableName} 中`);
          return true; 
       } else {
-         console.error(`添加列 ${columnName} 到 ${tableName} 失败，并且再次检查后列仍不存在。`);
+         console.error(`添加列 ${columnName} 到 ${tableName} 失败，并且再次检查后列仍不存在`);
          return false; 
       }
     }
@@ -696,12 +696,12 @@ export default {
       tgAdminId: normalizeIdList(env.TG_ADMIN_ID),
       tgStorageChatId: String(env.TG_STORAGE_CHAT_ID || '').trim(),
       cookie: Number(env.COOKIE) || 7,
-      // MAX_SIZE_MB 是业务总上限；Telegram 单片上限由下面几项单独控制。
+      // MAX_SIZE_MB 是业务总上限；Telegram 单片上限由下面几项单独控制
       maxSizeMB: Number(env.MAX_SIZE_MB) || 1024,
       telegramPhotoLimitMB: 10,
       telegramFileLimitMB: 50,
       telegramDownloadLimitMB: 20,
-      // 公开 Bot API 的 getFile 下载上限仍为 20MB，因此分片必须低于 20MB。
+      // 公开 Bot API 的 getFile 下载上限仍为 20MB，因此分片必须低于 20MB
       telegramChunkSizeMB: Math.min(19, Math.max(1, Number(env.TG_CHUNK_SIZE_MB) || 19)),
       bucket: env.BUCKET,
       fileCache: new Map(),
@@ -1027,7 +1027,7 @@ async function handleTelegramWebhook(request, config) {
     
         await sendMessage(
           chatId,
-          "⏸ 已暂停当前操作，已返回主菜单。",
+          "⏸ 已暂停当前操作，已返回主菜单",
           config.tgBotToken
         );
     
@@ -1042,7 +1042,7 @@ async function handleTelegramWebhook(request, config) {
     
       /*
        * 当前正在等待文字时，如果用户发送图片、文件、
-       * 视频、语音或贴纸，不允许进入上传流程。
+       * 视频、语音或贴纸，不允许进入上传流程
        */
       if (
         userSetting.waiting_for &&
@@ -1050,7 +1050,7 @@ async function handleTelegramWebhook(request, config) {
       ) {
         await sendInputPrompt(
           chatId,
-          "⚠️ 当前操作需要文字输入。\n\n" +
+          "⚠️ 当前操作需要文字输入\n\n" +
           getWaitingPromptText(
             userSetting.waiting_for
           ),
@@ -1096,12 +1096,12 @@ async function handleTelegramWebhook(request, config) {
          * 输入不符合要求：
          * 不清除 waiting_for；
          * 不返回主菜单；
-         * 继续等待管理员输入。
+         * 继续等待管理员输入
          */
         if (!targetUserId) {
           await sendInputPrompt(
             chatId,
-            "⚠️ 用户 ID 格式不正确。\n\n" +
+            "⚠️ 用户 ID 格式不正确\n\n" +
             "请继续输入纯数字 Telegram 用户 ID，" +
             "例如：123456789",
             config
@@ -1119,7 +1119,7 @@ async function handleTelegramWebhook(request, config) {
       
           /*
            * ID 格式有效且数据库操作完成后，
-           * 才清除等待状态。
+           * 才清除等待状态
            */
           await resetWaitingState(
             chatId,
@@ -1162,15 +1162,15 @@ async function handleTelegramWebhook(request, config) {
           );
       
           /*
-           * 数据库错误时也不要清除状态。
-           * 管理员仍可以重新输入，或者点击暂停按钮。
+           * 数据库错误时也不要清除状态
+           * 管理员仍可以重新输入，或者点击暂停按钮
            */
           await sendInputPrompt(
             chatId,
             "❌ 添加用户失败：" +
             escapeHtml(error.message) +
             "\n\n请重新输入用户 ID，" +
-            "或点击下方按钮暂停。",
+            "或点击下方按钮暂停",
             config
           );
       
@@ -1188,8 +1188,8 @@ async function handleTelegramWebhook(request, config) {
         if (!categoryName) {
           await sendInputPrompt(
             chatId,
-            "⚠️ 分类名称不能为空。\n\n" +
-            "请继续输入新分类名称。",
+            "⚠️ 分类名称不能为空\n\n" +
+            "请继续输入新分类名称",
             config
           );
       
@@ -1199,8 +1199,8 @@ async function handleTelegramWebhook(request, config) {
         if (categoryName.length > 50) {
           await sendInputPrompt(
             chatId,
-            "⚠️ 分类名称不能超过 50 个字符。\n\n" +
-            "请重新输入。",
+            "⚠️ 分类名称不能超过 50 个字符\n\n" +
+            "请重新输入",
             config
           );
       
@@ -1219,8 +1219,8 @@ async function handleTelegramWebhook(request, config) {
           if (existingCategory) {
             await sendInputPrompt(
               chatId,
-              `⚠️ 分类“${escapeHtml(categoryName)}”已存在。\n\n` +
-              "请继续输入其他分类名称。",
+              `⚠️ 分类“${escapeHtml(categoryName)}”已存在\n\n` +
+              "请继续输入其他分类名称",
               config
             );
       
@@ -1282,7 +1282,7 @@ async function handleTelegramWebhook(request, config) {
           await sendMessage(
             chatId,
             `✅ 分类“${escapeHtml(categoryName)}”` +
-            "创建成功，并已设为当前分类。",
+            "创建成功，并已设为当前分类",
             config.tgBotToken
           );
       
@@ -1304,7 +1304,7 @@ async function handleTelegramWebhook(request, config) {
             chatId,
             "❌ 创建分类失败：" +
             escapeHtml(error.message) +
-            "\n\n请重新输入，或点击暂停。",
+            "\n\n请重新输入，或点击暂停",
             config
           );
       
@@ -1380,8 +1380,8 @@ async function handleTelegramWebhook(request, config) {
           if (!fileToDelete) {
             await sendInputPrompt(
               chatId,
-              "⚠️ 未找到匹配的文件。\n\n" +
-              "请继续输入完整文件名称或完整 URL。",
+              "⚠️ 未找到匹配的文件\n\n" +
+              "请继续输入完整文件名称或完整 URL",
               config
             );
           
@@ -2062,7 +2062,7 @@ async function handleCallbackQuery(update, config, userSetting) {
     
       await sendInputPrompt(
         chatId,
-        "➕ 请输入需要授权的 Telegram 用户 ID。\n\n" +
+        "➕ 请输入需要授权的 Telegram 用户 ID\n\n" +
         "只输入纯数字，例如：123456789",
         config
       );
@@ -2127,7 +2127,7 @@ async function handleCallbackQuery(update, config, userSetting) {
             chat_id: chatId,
             text:
               "➖ 请选择要取消授权的用户：\n\n" +
-              "删除授权不会删除该用户已经上传的文件。",
+              "删除授权不会删除该用户已经上传的文件",
             reply_markup: {
               inline_keyboard: userButtons
             }
@@ -2241,40 +2241,44 @@ async function handleCallbackQuery(update, config, userSetting) {
       });
     }
     else if (cbData === 'create_category') {
-      // 管理员权限验证
-      if (
-        config.tgAdminId &&
-        config.tgAdminId.length > 0 &&
-        !config.tgAdminId.includes(chatId)
-      ) {
+      // 只有 TG_ADMIN_ID 管理员可以创建分类
+      if (!isTelegramAdmin(chatId, config)) {
         await answerPromise;
-    
+
         await sendMessage(
           chatId,
           "❌ 你没有权限创建分类，请联系管理员",
           config.tgBotToken
         );
-    
+
         return;
       }
-      if (config.buttonCache) {
-        config.buttonCache.set(cacheKey, {
-          timestamp: Date.now(),
-          responseText: "📝 请回复此消息，输入新分类名称"
-        });
-      }
+
+      // 先确认按钮回调并写入等待状态，再发送带“暂停”按钮的输入提示
+      // 原代码误将 config 对象当作 botToken 传给 sendMessage，
+      // 导致请求地址变成 bot[object Object]/sendMessage，点击后看起来没有反应
       await Promise.all([
         answerPromise,
-        sendMessage(chatId, "📝 请回复此消息，输入新分类名称", config),
-        config.database.prepare(
-          'UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?'
-        )
-          .bind('new_category', chatId)
-          .run()
+        config.database.prepare(`
+          UPDATE user_settings
+          SET waiting_for = ?,
+              editing_file_id = NULL
+          WHERE chat_id = ?
+        `).bind(
+          'new_category',
+          chatId
+        ).run()
       ]);
-    
+
       userSetting.waiting_for = 'new_category';
       userSetting.editing_file_id = null;
+
+      await sendInputPrompt(
+        chatId,
+        "📝 请输入新分类名称\n\n" +
+        "分类名称最多 50 个字符",
+        config
+      );
     }
     else if (cbData.startsWith('set_category_')) {
       const categoryId = Number(
@@ -2500,7 +2504,7 @@ async function handleCallbackQuery(update, config, userSetting) {
       await sendInputPrompt(
         chatId,
         "✏️ 请输入要修改后缀的文件完整名称，" +
-        "必须包含扩展名；也可以输入完整 URL。",
+        "必须包含扩展名；也可以输入完整 URL",
         config
       );
     
@@ -2527,7 +2531,7 @@ async function handleCallbackQuery(update, config, userSetting) {
       await sendInputPrompt(
         chatId,
         "🗑️ 请输入要删除的文件完整名称，" +
-        "必须包含扩展名；也可以输入完整 URL。",
+        "必须包含扩展名；也可以输入完整 URL",
         config
       );
     
@@ -3078,7 +3082,7 @@ async function loadChunkRows(file, config) {
   const chunks = result.results || [];
   if (chunks.length) return chunks;
 
-  // 兼容/恢复 tgNetDisc 风格的 fileAll.txt 清单。
+  // 兼容/恢复 tgNetDisc 风格的 fileAll.txt 清单
   const manifestResponse = await getTelegramFileResponse(file.fileId, config);
   const manifestText = await manifestResponse.text();
   const lines = manifestText.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
@@ -3151,7 +3155,7 @@ function createTelegramChunkStream(selections, config) {
           );
 
           if (!selected.fullChunk && response.status !== 206) {
-            // Telegram 若忽略 Range，单片最多 19MB，可安全回退为内存切片。
+            // Telegram 若忽略 Range，单片最多 19MB，可安全回退为内存切片
             const buffer = await response.arrayBuffer();
             const sliced = buffer.slice(selected.localStart, selected.localEnd + 1);
             controller.enqueue(new Uint8Array(sliced));
@@ -3221,8 +3225,8 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     const botDownloadLimit = Number(config.telegramDownloadLimitMB || 20) * 1024 * 1024;
     if (declaredSize > botDownloadLimit) {
       throw new Error(
-        `Telegram 云端 Bot API 只能通过 getFile 下载不超过 ${config.telegramDownloadLimitMB}MB 的文件。` +
-        '请改用网页上传，大文件会自动分片。'
+        `Telegram 云端 Bot API 只能通过 getFile 下载不超过 ${config.telegramDownloadLimitMB}MB 的文件` +
+        '请改用网页上传，大文件会自动分片'
       );
     }
     if (declaredSize > Number(config.maxSizeMB) * 1024 * 1024) {
@@ -3240,8 +3244,8 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     const actualSize = Number(data.result.file_size || declaredSize || 0);
     if (actualSize > botDownloadLimit) {
       throw new Error(
-        `文件为 ${formatSize(actualSize)}，超过 Telegram Bot API 的 ${config.telegramDownloadLimitMB}MB 下载限制。` +
-        '请使用网页分片上传。'
+        `文件为 ${formatSize(actualSize)}，超过 Telegram Bot API 的 ${config.telegramDownloadLimitMB}MB 下载限制` +
+        '请使用网页分片上传'
       );
     }
     if (actualSize > Number(config.maxSizeMB) * 1024 * 1024) {
@@ -4189,7 +4193,7 @@ async function handleFileRequest(request, config) {
       return response;
     };
 
-    // R2 原始 key 优先。
+    // R2 原始 key 优先
     if (config.bucket) {
       try {
         const object = await config.bucket.get(path);
@@ -4613,27 +4617,27 @@ function isPauseCommand(text) {
 function getWaitingPromptText(waitingFor) {
   const promptMap = {
     add_user_id:
-      "请输入纯数字 Telegram 用户 ID，例如：123456789。",
+      "请输入纯数字 Telegram 用户 ID，例如：123456789",
 
     new_category:
-      "请输入新的分类名称。",
+      "请输入新的分类名称",
 
     edit_suffix_input_file:
-      "请输入完整文件名称（包含扩展名）或完整 URL。",
+      "请输入完整文件名称（包含扩展名）或完整 URL",
 
     edit_suffix_input_new:
-      "请输入新的文件后缀，不要包含扩展名。",
+      "请输入新的文件后缀，不要包含扩展名",
 
     delete_file_input:
-      "请输入要删除的完整文件名称或完整 URL。",
+      "请输入要删除的完整文件名称或完整 URL",
 
     new_suffix:
-      "请输入新的文件后缀。"
+      "请输入新的文件后缀"
   };
 
   return (
     promptMap[waitingFor] ||
-    "请继续输入当前操作需要的文字内容。"
+    "请继续输入当前操作需要的文字内容"
   );
 }
 
@@ -5958,8 +5962,8 @@ function generateUserManagementPage() {
       <div id="messageBox" class="message"></div>
 
       <p class="hint">
-        只填写 Telegram 用户 ID，不要填写用户名或 @username。
-        TG_ADMIN_ID 管理员无需重复添加。
+        只填写 Telegram 用户 ID，不要填写用户名或 @username
+        TG_ADMIN_ID 管理员无需重复添加
       </p>
     </div>
 
@@ -6208,7 +6212,7 @@ function generateUserManagementPage() {
     async function deleteUser(chatId) {
       const confirmed = window.confirm(
         '确定取消用户 ' + chatId + ' 的使用权限吗？\\n\\n' +
-        '该操作不会删除用户已经上传的文件。'
+        '该操作不会删除用户已经上传的文件'
       );
 
       if (!confirmed) {
