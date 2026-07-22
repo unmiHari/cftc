@@ -899,64 +899,136 @@ async function handleTelegramWebhook(request, config) {
       };
     }
     if (update.message) {
+      const incomingText =
+        typeof update.message.text === 'string'
+          ? update.message.text
+          : '';
+    
+      /*
+       * 等待输入期间，用户可以发送以下内容暂停：
+       * /start
+       * /cancel
+       * 暂停
+       * 取消
+       * 返回
+       */
+      if (
+        userSetting.waiting_for &&
+        isPauseCommand(incomingText)
+      ) {
+        await resetWaitingState(
+          chatId,
+          userSetting,
+          config
+        );
+    
+        await sendMessage(
+          chatId,
+          "⏸ 已暂停当前操作，已返回主菜单。",
+          config.tgBotToken
+        );
+    
+        await sendPanel(
+          chatId,
+          userSetting,
+          config
+        );
+    
+        return new Response('OK');
+      }
+    
+      /*
+       * 当前正在等待文字时，如果用户发送图片、文件、
+       * 视频、语音或贴纸，不允许进入上传流程。
+       */
+      if (
+        userSetting.waiting_for &&
+        !update.message.text
+      ) {
+        await sendInputPrompt(
+          chatId,
+          "⚠️ 当前操作需要文字输入。\n\n" +
+          getWaitingPromptText(
+            userSetting.waiting_for
+          ),
+          config
+        );
+    
+        return new Response('OK');
+      }
+    
       // 管理员正在输入要添加的用户 ID
       if (
         userSetting.waiting_for === 'add_user_id' &&
         update.message.text
       ) {
+        // 再次验证管理员权限
         if (!isTelegramAdmin(chatId, config)) {
-          await config.database.prepare(`
-            UPDATE user_settings
-            SET waiting_for = NULL
-            WHERE chat_id = ?
-          `).bind(chatId).run();
-    
-          userSetting.waiting_for = null;
-    
+          await resetWaitingState(
+            chatId,
+            userSetting,
+            config
+          );
+      
           await sendMessage(
             chatId,
             "❌ 只有 TG_ADMIN_ID 管理员可以添加用户",
             config.tgBotToken
           );
-    
+      
+          await sendPanel(
+            chatId,
+            userSetting,
+            config
+          );
+      
           return new Response('OK');
         }
-    
+      
         const targetUserId = normalizeTelegramUserId(
           update.message.text
         );
-    
+      
+        /*
+         * 输入不符合要求：
+         * 不清除 waiting_for；
+         * 不返回主菜单；
+         * 继续等待管理员输入。
+         */
         if (!targetUserId) {
-          await sendMessage(
+          await sendInputPrompt(
             chatId,
             "⚠️ 用户 ID 格式不正确。\n\n" +
-            "请输入纯数字 Telegram 用户 ID，例如：123456789",
-            config.tgBotToken
+            "请继续输入纯数字 Telegram 用户 ID，" +
+            "例如：123456789",
+            config
           );
-    
-          // 不清除等待状态，管理员可以重新输入
+      
           return new Response('OK');
         }
-    
+      
         try {
           const result = await addAllowedTelegramUser(
             targetUserId,
             chatId,
             config
           );
-    
-          await config.database.prepare(`
-            UPDATE user_settings
-            SET waiting_for = NULL
-            WHERE chat_id = ?
-          `).bind(chatId).run();
-    
-          userSetting.waiting_for = null;
-    
+      
+          /*
+           * ID 格式有效且数据库操作完成后，
+           * 才清除等待状态。
+           */
+          await resetWaitingState(
+            chatId,
+            userSetting,
+            config
+          );
+      
           if (result.alreadyAdmin) {
             await sendMessage(
               chatId,
-              `ℹ️ 用户 ${targetUserId} 已经是 TG_ADMIN_ID 管理员，无需重复添加`,
+              `ℹ️ 用户 ${targetUserId} 已经是 ` +
+              "TG_ADMIN_ID 管理员，无需重复添加",
               config.tgBotToken
             );
           } else if (!result.created) {
@@ -972,50 +1044,169 @@ async function handleTelegramWebhook(request, config) {
               config.tgBotToken
             );
           }
-        } catch (error) {
-          console.error('添加授权用户失败:', error);
-    
-          await sendMessage(
+      
+          await sendPanel(
             chatId,
-            `❌ 添加用户失败：${error.message}`,
-            config.tgBotToken
+            userSetting,
+            config
           );
+      
+          return new Response('OK');
+        } catch (error) {
+          console.error(
+            '添加授权用户失败:',
+            error
+          );
+      
+          /*
+           * 数据库错误时也不要清除状态。
+           * 管理员仍可以重新输入，或者点击暂停按钮。
+           */
+          await sendInputPrompt(
+            chatId,
+            "❌ 添加用户失败：" +
+            escapeHtml(error.message) +
+            "\n\n请重新输入用户 ID，" +
+            "或点击下方按钮暂停。",
+            config
+          );
+      
+          return new Response('OK');
         }
-    
-        await sendPanel(chatId, userSetting, config);
-        return new Response('OK');
       }
-    
       else if (
         userSetting.waiting_for === 'new_category' &&
         update.message.text
       ) {
-        const categoryName = update.message.text.trim();
+        const categoryName = String(
+          update.message.text || ''
+        ).trim();
+      
+        if (!categoryName) {
+          await sendInputPrompt(
+            chatId,
+            "⚠️ 分类名称不能为空。\n\n" +
+            "请继续输入新分类名称。",
+            config
+          );
+      
+          return new Response('OK');
+        }
+      
+        if (categoryName.length > 50) {
+          await sendInputPrompt(
+            chatId,
+            "⚠️ 分类名称不能超过 50 个字符。\n\n" +
+            "请重新输入。",
+            config
+          );
+      
+          return new Response('OK');
+        }
+      
         try {
-          const existingCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
+          const existingCategory =
+            await config.database.prepare(`
+              SELECT id
+              FROM categories
+              WHERE name = ?
+              LIMIT 1
+            `).bind(categoryName).first();
+      
           if (existingCategory) {
-            await sendMessage(chatId, `⚠️ 分类"${categoryName}"已存在`, config.tgBotToken);
-          } else {
-            const time = Date.now();
-            await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)').bind(categoryName, time).run();
-            const newCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
-            await config.database.prepare('UPDATE user_settings SET current_category_id = ?, waiting_for = NULL WHERE chat_id = ?').bind(newCategory.id, chatId).run();
-            await sendMessage(chatId, `✅ 分类"${categoryName}"创建成功并已设为当前分类`, config.tgBotToken);
+            await sendInputPrompt(
+              chatId,
+              `⚠️ 分类“${escapeHtml(categoryName)}”已存在。\n\n` +
+              "请继续输入其他分类名称。",
+              config
+            );
+      
+            return new Response('OK');
           }
-  } catch (error) {
-          console.error('创建分类失败:', error);
-          await sendMessage(chatId, `❌ 创建分类失败: ${error.message}`, config.tgBotToken);
-        }
-        await config.database.prepare('UPDATE user_settings SET waiting_for = NULL WHERE chat_id = ?').bind(chatId).run();
-        userSetting.waiting_for = null;
-        if (categoryName) {
-          const newCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
-          if (newCategory) {
-            userSetting.current_category_id = newCategory.id;
+      
+          const result =
+            await config.database.prepare(`
+              INSERT INTO categories (
+                name,
+                created_at
+              )
+              VALUES (?, ?)
+            `).bind(
+              categoryName,
+              Date.now()
+            ).run();
+      
+          let newCategoryId =
+            result.meta &&
+            result.meta.last_row_id;
+      
+          if (!newCategoryId) {
+            const newCategory =
+              await config.database.prepare(`
+                SELECT id
+                FROM categories
+                WHERE name = ?
+                LIMIT 1
+              `).bind(categoryName).first();
+      
+            newCategoryId =
+              newCategory && newCategory.id;
           }
+      
+          if (!newCategoryId) {
+            throw new Error(
+              '创建后未能获取分类 ID'
+            );
+          }
+      
+          await config.database.prepare(`
+            UPDATE user_settings
+            SET current_category_id = ?,
+                waiting_for = NULL,
+                editing_file_id = NULL
+            WHERE chat_id = ?
+          `).bind(
+            newCategoryId,
+            chatId
+          ).run();
+      
+          userSetting.current_category_id =
+            newCategoryId;
+      
+          userSetting.waiting_for = null;
+          userSetting.editing_file_id = null;
+      
+          await sendMessage(
+            chatId,
+            `✅ 分类“${escapeHtml(categoryName)}”` +
+            "创建成功，并已设为当前分类。",
+            config.tgBotToken
+          );
+      
+          await sendPanel(
+            chatId,
+            userSetting,
+            config
+          );
+      
+          return new Response('OK');
+        } catch (error) {
+          console.error(
+            '创建分类失败:',
+            error
+          );
+      
+          // 出错后仍保留 new_category 状态
+          await sendInputPrompt(
+            chatId,
+            "❌ 创建分类失败：" +
+            escapeHtml(error.message) +
+            "\n\n请重新输入，或点击暂停。",
+            config
+          );
+      
+          return new Response('OK');
         }
-        await sendPanel(chatId, userSetting, config);
-        return new Response('OK');
       }
       else if (userSetting.waiting_for === 'new_suffix' && update.message.text && userSetting.editing_file_id) {
         const newSuffix = update.message.text.trim();
@@ -1081,14 +1272,16 @@ async function handleTelegramWebhook(request, config) {
       }
       else if (userSetting.waiting_for === 'delete_file_input' && update.message.text) {
         try {
-          await config.database.prepare('UPDATE user_settings SET waiting_for = NULL WHERE chat_id = ?')
-            .bind(chatId).run();
-          userSetting.waiting_for = null;
           const userInput = update.message.text;
           let fileToDelete = await findFileRecord(userInput, chatId, config);
           if (!fileToDelete) {
-            await sendMessage(chatId, "⚠️ 未找到匹配的文件，请输入完整的文件名称或URL", config.tgBotToken);
-            await sendPanel(chatId, userSetting, config);
+            await sendInputPrompt(
+              chatId,
+              "⚠️ 未找到匹配的文件。\n\n" +
+              "请继续输入完整文件名称或完整 URL。",
+              config
+            );
+          
             return new Response('OK');
           }
           const fileName = fileToDelete.file_name || getFileName(fileToDelete.url);
@@ -1123,6 +1316,11 @@ async function handleTelegramWebhook(request, config) {
             storageDeleteSuccess = true;
           }
           await config.database.prepare('DELETE FROM files WHERE id = ?').bind(fileToDelete.id).run();
+          await resetWaitingState(
+            chatId,
+            userSetting,
+            config
+          );
           console.log(`[TG Delete] 数据库记录已删除: ID=${fileToDelete.id}`);
           const cacheKey = `file:${fileName}`;
           if (config.fileCache && config.fileCache.has(cacheKey)) {
@@ -1587,6 +1785,32 @@ async function handleCallbackQuery(update, config, userSetting) {
     console.error('确认回调查询失败:', error);
   });
   try {
+    // 点击“暂停并返回主菜单”
+    if (cbData === 'pause_and_back') {
+      await answerPromise;
+    
+      // 清空当前操作状态
+      await resetWaitingState(
+        chatId,
+        userSetting,
+        config
+      );
+    
+      // 删除带暂停按钮的提示
+      await deleteCallbackSourceMessage(
+        update,
+        config
+      );
+    
+      // 回到初始主菜单
+      await sendPanel(
+        chatId,
+        userSetting,
+        config
+      );
+    
+      return;
+    }
     if (
       userSetting.waiting_for &&
       !cbData.startsWith('delete_file_do_')
@@ -1629,14 +1853,25 @@ async function handleCallbackQuery(update, config, userSetting) {
       }
     }
     const cacheKey = `button:${chatId}:${cbData}`;
-    const isUserManagementCallback =
+    const isStatefulOrNavigationCallback =
+      cbData === 'switch_storage' ||
       cbData === 'add_user' ||
       cbData === 'delete_user' ||
-      cbData.startsWith('remove_user_');
+      cbData === 'create_category' ||
+      cbData === 'list_categories' ||
+      cbData === 'recent_files' ||
+      cbData === 'edit_suffix' ||
+      cbData === 'edit_suffix_input' ||
+      cbData === 'delete_file_input' ||
+      cbData === 'back_to_panel' ||
+      cbData === 'pause_and_back' ||
+      cbData.startsWith('remove_user_') ||
+      cbData.startsWith('set_category_') ||
+      cbData.startsWith('edit_suffix_file_');
     if (
       config.buttonCache &&
       config.buttonCache.has(cacheKey) &&
-      !isUserManagementCallback &&
+      !isStatefulOrNavigationCallback &&
       !cbData.startsWith('delete_file_confirm_') &&
       !cbData.startsWith('delete_file_do_')
     ) {
@@ -1750,11 +1985,11 @@ async function handleCallbackQuery(update, config, userSetting) {
       userSetting.waiting_for = 'add_user_id';
       userSetting.editing_file_id = null;
     
-      await sendMessage(
+      await sendInputPrompt(
         chatId,
-        "➕ 请回复此消息，输入需要授权的 Telegram 用户 ID。\n\n" +
+        "➕ 请输入需要授权的 Telegram 用户 ID。\n\n" +
         "只输入纯数字，例如：123456789",
-        config.tgBotToken
+        config
       );
     }
     else if (cbData === 'delete_user') {
@@ -1799,6 +2034,12 @@ async function handleCallbackQuery(update, config, userSetting) {
           callback_data: "back_to_panel"
         }
       ]);
+
+      // 删除上一级主菜单
+      await deleteCallbackSourceMessage(
+        update,
+        config
+      );
     
       await fetch(
         `https://api.telegram.org/bot${config.tgBotToken}/sendMessage`,
@@ -1876,7 +2117,11 @@ async function handleCallbackQuery(update, config, userSetting) {
           config.tgBotToken
         );
       }
-    
+
+      await deleteCallbackSourceMessage(
+        update,
+        config
+      );
       await sendPanel(chatId, userSetting, config);
     }
     else if (cbData === 'list_categories') {
@@ -1895,6 +2140,13 @@ async function handleCallbackQuery(update, config, userSetting) {
           { text: cat.name, callback_data: `set_category_${cat.id}` }
         ]).concat([[{ text: "« 返回", callback_data: "back_to_panel" }]])
       };
+
+      // 下一级包含返回按钮，删除上一级主菜单
+      await deleteCallbackSourceMessage(
+        update,
+        config
+      );
+      
       if (config.buttonCache) {
         config.buttonCache.set(cacheKey, {
           timestamp: Date.now(),
@@ -1902,6 +2154,7 @@ async function handleCallbackQuery(update, config, userSetting) {
           replyMarkup: keyboard
         });
       }
+      
       await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1937,7 +2190,7 @@ async function handleCallbackQuery(update, config, userSetting) {
       }
       await Promise.all([
         answerPromise,
-        sendMessage(chatId, "📝 请回复此消息，输入新分类名称", config.tgBotToken),
+        sendMessage(chatId, "📝 请回复此消息，输入新分类名称", config),
         config.database.prepare(
           'UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?'
         )
@@ -1946,42 +2199,104 @@ async function handleCallbackQuery(update, config, userSetting) {
       ]);
     
       userSetting.waiting_for = 'new_category';
+      userSetting.editing_file_id = null;
     }
     else if (cbData.startsWith('set_category_')) {
-      const categoryId = parseInt(cbData.split('_')[2]);
-      const updatePromise = config.database.prepare(
-        'UPDATE user_settings SET current_category_id = ? WHERE chat_id = ?'
-      ).bind(categoryId, chatId).run();
-      const categoryPromise = config.database.prepare(
-        'SELECT name FROM categories WHERE id = ?'
-      ).bind(categoryId).first();
+      const categoryId = Number(
+        cbData.slice('set_category_'.length)
+      );
+    
       await answerPromise;
-      const [_, category] = await Promise.all([updatePromise, categoryPromise]);
-      const responseText = `✅ 已切换到分类: ${category?.name || '未知分类'}`;
-      if (config.buttonCache) {
-        config.buttonCache.set(`button:${chatId}:${cbData}`, {
-          timestamp: Date.now(),
-          responseText,
-          sendPanel: true
-        });
+    
+      if (
+        !Number.isInteger(categoryId) ||
+        categoryId <= 0
+      ) {
+        await sendMessage(
+          chatId,
+          "❌ 无效的分类 ID",
+          config.tgBotToken
+        );
+    
+        return;
       }
-      await sendMessage(chatId, responseText, config.tgBotToken);
-      await sendPanel(chatId, { ...userSetting, current_category_id: categoryId }, config);
+    
+      const category = await config.database.prepare(`
+        SELECT id, name
+        FROM categories
+        WHERE id = ?
+        LIMIT 1
+      `).bind(categoryId).first();
+    
+      if (!category) {
+        await sendMessage(
+          chatId,
+          "⚠️ 该分类不存在或已被删除",
+          config.tgBotToken
+        );
+    
+        return;
+      }
+    
+      await config.database.prepare(`
+        UPDATE user_settings
+        SET current_category_id = ?,
+            waiting_for = NULL,
+            editing_file_id = NULL
+        WHERE chat_id = ?
+      `).bind(
+        categoryId,
+        chatId
+      ).run();
+    
+      userSetting.current_category_id = categoryId;
+      userSetting.waiting_for = null;
+      userSetting.editing_file_id = null;
+    
+      // 删除分类选择列表
+      await deleteCallbackSourceMessage(
+        update,
+        config
+      );
+    
+      await sendMessage(
+        chatId,
+        `✅ 已切换到分类：${escapeHtml(category.name)}`,
+        config.tgBotToken
+      );
+    
+      await sendPanel(
+        chatId,
+        userSetting,
+        config
+      );
+    
+      return;
     }
     else if (cbData === 'back_to_panel') {
-      if (config.buttonCache) {
-        config.buttonCache.set(cacheKey, {
-          timestamp: Date.now(),
-          sendPanel: true
-        });
-      }
       await answerPromise;
-      if (userSetting.waiting_for) {
-        await config.database.prepare('UPDATE user_settings SET waiting_for = NULL, editing_file_id = NULL WHERE chat_id = ?').bind(chatId).run();
-        userSetting.waiting_for = null;
-        userSetting.editing_file_id = null;
-      }
-      await sendPanel(chatId, userSetting, config);
+    
+      // 清除可能遗留的等待状态
+      await resetWaitingState(
+        chatId,
+        userSetting,
+        config
+      );
+    
+      // 删除当前带“返回”按钮的子菜单
+      await deleteCallbackSourceMessage(
+        update,
+        config
+      );
+    
+      // 重新发送主菜单
+      await sendPanel(
+        chatId,
+        userSetting,
+        config
+      );
+    
+      return;
     }
     if (cbData === 'r2_stats') {
       // 管理员权限验证
@@ -2066,6 +2381,10 @@ async function handleCallbackQuery(update, config, userSetting) {
           [{ text: "« 返回", callback_data: "back_to_panel" }]
         ]
       };
+      await deleteCallbackSourceMessage(
+        update,
+        config
+      );
       if (config.buttonCache) {
          config.buttonCache.set(cacheKey, {
            timestamp: Date.now(),
@@ -2087,17 +2406,57 @@ async function handleCallbackQuery(update, config, userSetting) {
     }
     else if (cbData === 'edit_suffix_input') {
       await answerPromise;
-      await config.database.prepare('UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?')
-        .bind('edit_suffix_input_file', chatId).run();
-      userSetting.waiting_for = 'edit_suffix_input_file';
-      await sendMessage(chatId, "✏️ 请回复此消息，输入要修改后缀的文件完整名称（必须包含扩展名）或完整URL链接", config.tgBotToken);
+    
+      await config.database.prepare(`
+        UPDATE user_settings
+        SET waiting_for = ?,
+            editing_file_id = NULL
+        WHERE chat_id = ?
+      `).bind(
+        'edit_suffix_input_file',
+        chatId
+      ).run();
+    
+      userSetting.waiting_for =
+        'edit_suffix_input_file';
+    
+      userSetting.editing_file_id = null;
+    
+      await sendInputPrompt(
+        chatId,
+        "✏️ 请输入要修改后缀的文件完整名称，" +
+        "必须包含扩展名；也可以输入完整 URL。",
+        config
+      );
+    
+      return;
     }
     else if (cbData === 'delete_file_input') {
       await answerPromise;
-      await config.database.prepare('UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?')
-        .bind('delete_file_input', chatId).run();
-      userSetting.waiting_for = 'delete_file_input';
-      await sendMessage(chatId, "🗑️ 请回复此消息，输入要删除的文件完整名称（必须包含扩展名）或完整URL链接", config.tgBotToken);
+    
+      await config.database.prepare(`
+        UPDATE user_settings
+        SET waiting_for = ?,
+            editing_file_id = NULL
+        WHERE chat_id = ?
+      `).bind(
+        'delete_file_input',
+        chatId
+      ).run();
+    
+      userSetting.waiting_for =
+        'delete_file_input';
+    
+      userSetting.editing_file_id = null;
+    
+      await sendInputPrompt(
+        chatId,
+        "🗑️ 请输入要删除的文件完整名称，" +
+        "必须包含扩展名；也可以输入完整 URL。",
+        config
+      );
+    
+      return;
     }
     else if (cbData.startsWith('delete_file_confirm_')) {
     }
@@ -3455,33 +3814,227 @@ function formatDate(timestamp) {
     return '日期格式化错误';
   }
 }
-async function sendMessage(chatId, text, botToken, replyToMessageId = null) {
+async function sendMessage(
+  chatId,
+  text,
+  botToken,
+  replyToMessageId = null,
+  replyMarkup = null
+) {
   try {
     const requestBody = {
       chat_id: chatId,
       text: text,
       parse_mode: 'HTML'
     };
+
     if (replyToMessageId) {
       requestBody.reply_to_message_id = replyToMessageId;
     }
-    const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(requestBody)
-    });
+
+    // 新增：允许 sendMessage 附带按钮
+    if (replyMarkup) {
+      requestBody.reply_markup = replyMarkup;
+    }
+
+    const response = await fetch(
+      `https://api.telegram.org/bot${botToken}/sendMessage`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(requestBody)
+      }
+    );
+
     if (!response.ok) {
       const errorData = await response.text();
-      console.error(`发送消息失败: HTTP ${response.status}, ${errorData}`);
+
+      console.error(
+        `发送消息失败: HTTP ${response.status}, ${errorData}`
+      );
+
       return null;
     }
+
     return await response.json();
   } catch (error) {
     console.error('发送消息错误:', error);
     return null;
   }
+}
+// 生成“暂停并返回主菜单”按钮
+function getPauseKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: "⏸ 暂停并返回主菜单",
+          callback_data: "pause_and_back"
+        }
+      ]
+    ]
+  };
+}
+
+
+// 发送需要用户继续输入的提示
+async function sendInputPrompt(chatId, text, config) {
+  return sendMessage(
+    chatId,
+    text,
+    config.tgBotToken,
+    null,
+    getPauseKeyboard()
+  );
+}
+
+
+// 判断用户是否通过文字取消当前操作
+function isPauseCommand(text) {
+  const normalized = String(text || '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .trim()
+    .toLowerCase();
+
+  return [
+    '/start',
+    '/cancel',
+    '取消',
+    '暂停',
+    '返回'
+  ].includes(normalized);
+}
+
+
+// 根据等待状态返回对应提示
+function getWaitingPromptText(waitingFor) {
+  const promptMap = {
+    add_user_id:
+      "请输入纯数字 Telegram 用户 ID，例如：123456789。",
+
+    new_category:
+      "请输入新的分类名称。",
+
+    edit_suffix_input_file:
+      "请输入完整文件名称（包含扩展名）或完整 URL。",
+
+    edit_suffix_input_new:
+      "请输入新的文件后缀，不要包含扩展名。",
+
+    delete_file_input:
+      "请输入要删除的完整文件名称或完整 URL。",
+
+    new_suffix:
+      "请输入新的文件后缀。"
+  };
+
+  return (
+    promptMap[waitingFor] ||
+    "请继续输入当前操作需要的文字内容。"
+  );
+}
+
+
+// 统一清除所有输入等待状态
+async function resetWaitingState(
+  chatId,
+  userSetting,
+  config
+) {
+  await config.database.prepare(`
+    UPDATE user_settings
+    SET waiting_for = NULL,
+        editing_file_id = NULL
+    WHERE chat_id = ?
+  `).bind(chatId).run();
+
+  if (userSetting) {
+    userSetting.waiting_for = null;
+    userSetting.editing_file_id = null;
+  }
+}
+
+
+// 删除一条 Telegram 消息
+async function deleteTelegramMessage(
+  chatId,
+  messageId,
+  botToken
+) {
+  if (!chatId || !messageId || !botToken) {
+    return false;
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.telegram.org/bot${botToken}/deleteMessage`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId
+        })
+      }
+    );
+
+    const result = await response.json().catch(() => null);
+
+    if (
+      !response.ok ||
+      !result ||
+      !result.ok
+    ) {
+      console.warn(
+        '[TG Menu] 删除旧消息失败:',
+        result || `HTTP ${response.status}`
+      );
+
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.warn(
+      '[TG Menu] 删除旧消息时出错:',
+      error
+    );
+
+    return false;
+  }
+}
+
+
+// 删除用户刚才点击按钮所在的消息
+async function deleteCallbackSourceMessage(update, config) {
+  const callbackMessage =
+    update &&
+    update.callback_query &&
+    update.callback_query.message;
+
+  if (!callbackMessage) {
+    return false;
+  }
+
+  return deleteTelegramMessage(
+    callbackMessage.chat.id,
+    callbackMessage.message_id,
+    config.tgBotToken
+  );
+}
+
+// 转义动态文本，避免 Telegram HTML 解析失败
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 function generateLoginPage() {
   return `<!DOCTYPE html>
