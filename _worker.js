@@ -117,8 +117,8 @@ async function recreateAllTables(config) {
       )
     `).run();
 
-    // 机器人“上传大文件”按钮生成的一次性网页会话。
-    // expires_at 只限制尚未开始的会话；首片上传成功后即使超时也允许继续完成。
+    // 机器人“上传大文件”按钮生成的一次性网页会话
+    // expires_at 只限制尚未开始的会话；首片上传成功后即使超时也允许继续完成
     await config.database.prepare(`
       CREATE TABLE IF NOT EXISTS bot_upload_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -870,7 +870,7 @@ export default {
         : 20,
       // 公开 Bot API 的 getFile 下载上限仍为 20MB，因此分片必须低于 20MB
       telegramChunkSizeMB: Math.min(19, Math.max(1, Number(env.TG_CHUNK_SIZE_MB) || 19)),
-      // 机器人专属大文件上传页在开始上传前的有效时长，单位：分钟。
+      // 机器人专属大文件上传页在开始上传前的有效时长，单位：分钟
       updateTimeMinutes,
       bucket: env.BUCKET,
       fileCache: new Map(),
@@ -878,14 +878,14 @@ export default {
       buttonCache: new Map(),
       buttonCacheTTL: 600000,
       menuCache: new Map(),
-      // 菜单含临时 URL，缓存最长不超过 UPDATE_TIME 的一半。
+      // 菜单含临时 URL，缓存最长不超过 UPDATE_TIME 的一半
       menuCacheTTL: Math.min(300000, updateTimeMinutes * 30 * 1000),
       notificationCache: '',
       notificationCacheTTL: 3600000,
       lastNotificationFetch: 0
     };
 
-    // 兼容仍只接收 botToken 的旧辅助函数；同一 Worker 环境使用同一套 Telegram 端点。
+    // 兼容仍只接收 botToken 的旧辅助函数；同一 Worker 环境使用同一套 Telegram 端点
     globalThis.__TG_BOT_API_BASE_URL = config.tgApiBaseUrl;
     globalThis.__TG_BOT_FILE_BASE_URL = config.tgFileBaseUrl;
     if (config.enableAuth && (!config.username || !config.password)) {
@@ -1106,8 +1106,8 @@ export default {
     return await handleFileRequest(request, config);
   },
 
-  // 需要在 Cloudflare Workers 中配置 Cron Trigger（建议每分钟执行一次）。
-  // 它保证用户关闭临时网页后，超时任务仍会被自动取消并清理分片。
+  // 需要在 Cloudflare Workers 中配置 Cron Trigger（建议每分钟执行一次）
+  // 它保证用户关闭临时网页后，超时任务仍会被自动取消并清理分片
   async scheduled(_controller, env, executionCtx) {
     if (!env.DATABASE) {
       console.error('[Large Upload Cleanup] 缺少 DATABASE，跳过定时清理');
@@ -1931,7 +1931,7 @@ async function generateMainMenu(chatId, userSetting, config) {
 function getKeyboardLayout(userSetting, isAdmin = false, largeUploadUrl = '') {
   const rows = [];
 
-  // URL 按钮可在一次点击后直接打开专属页面；链接由菜单生成时临时创建。
+  // URL 按钮可在一次点击后直接打开专属页面；链接由菜单生成时临时创建
   if (largeUploadUrl) {
     rows.push([
       {
@@ -2685,7 +2685,7 @@ async function handleCallbackQuery(update, config, userSetting) {
       const fileName = getStoredDisplayName(file);
       const chunkText = Number(file.is_chunked || 0) === 1
         ? `
-🧩 这是分片文件，共 ${Number(file.chunk_count || 0)} 片；修改名称不会重新上传分片。`
+🧩 这是分片文件，共 ${Number(file.chunk_count || 0)} 片；修改名称不会重新上传分片`
         : '';
       await sendInputPrompt(
         chatId,
@@ -2710,7 +2710,7 @@ async function handleCallbackQuery(update, config, userSetting) {
       }
       const chunkText = Number(file.is_chunked || 0) === 1
         ? `
-🧩 将同时删除 ${Number(file.chunk_count || 0)} 个分片和 1 个清单文件。`
+🧩 将同时删除 ${Number(file.chunk_count || 0)} 个分片和 1 个清单文件`
         : '';
       await fetch(telegramMethodUrl(config.tgBotToken, 'sendMessage', config), {
         method: 'POST',
@@ -2719,7 +2719,7 @@ async function handleCallbackQuery(update, config, userSetting) {
           chat_id: chatId,
           text: `⚠️ 确定删除“${getStoredDisplayName(file)}”吗？${chunkText}
 
-删除后直链将立即失效。`,
+删除后直链将立即失效`,
           reply_markup: {
             inline_keyboard: [[
               { text: '✅ 确认删除', callback_data: `delete_file_do_${file.id}` },
@@ -2747,7 +2747,7 @@ async function handleCallbackQuery(update, config, userSetting) {
       await deleteCallbackSourceMessage(update, config);
       const warning = deleted.failedTelegramMessages.length
         ? `
-⚠️ ${deleted.failedTelegramMessages.length} 条 Telegram 存储消息未能立即删除，但文件记录和直链已清理。`
+⚠️ ${deleted.failedTelegramMessages.length} 条 Telegram 存储消息未能立即删除，但文件记录和直链已清理`
         : '';
       await sendMessage(
         chatId,
@@ -3546,7 +3546,7 @@ function normalizePublicFileStem(value) {
     .replace(/[\\/]/g, '_')
     .trim();
   stem = stem.replace(/\s+/g, ' ');
-  // 用户偶尔会把完整文件名贴进来；只移除与旧文件相同扩展名由调用处处理。
+  // 用户偶尔会把完整文件名贴进来；只移除与旧文件相同扩展名由调用处处理
   if (!stem) throw new Error('新文件名不能为空');
   if (stem === '.' || stem === '..') throw new Error('新文件名无效');
   if (stem.length > 120) throw new Error('新文件名不能超过 120 个字符');
@@ -3623,7 +3623,7 @@ async function renameStoredFileRecord(file, requestedStem, config) {
     ).run();
     fileRowUpdated = true;
 
-    // 专属大文件页完成后会保存永久直链；改名时同步更新，避免状态页返回旧地址。
+    // 专属大文件页完成后会保存永久直链；改名时同步更新，避免状态页返回旧地址
     await config.database.prepare(`
       UPDATE bot_upload_sessions
       SET result_url = ?, file_name = ?
@@ -3653,7 +3653,7 @@ async function renameStoredFileRecord(file, requestedStem, config) {
     throw error;
   }
 
-  // 数据库已经指向新对象后，旧 R2 对象删除失败不应回滚新名称，避免把记录指向已删除对象。
+  // 数据库已经指向新对象后，旧 R2 对象删除失败不应回滚新名称，避免把记录指向已删除对象
   if (copiedR2Object && file.fileId !== newStorageKey) {
     try {
       await config.bucket.delete(file.fileId);
@@ -3680,7 +3680,7 @@ async function deleteStoredFileRecord(file, config) {
   let deletedChunkRows = 0;
   let deletedStorageMessages = 0;
 
-  // 先使完成会话中的旧直链失效，避免外键或状态页残留。
+  // 先使完成会话中的旧直链失效，避免外键或状态页残留
   await config.database.prepare(`
     UPDATE bot_upload_sessions
     SET status = 'cancelled', result_file_id = NULL, result_url = NULL,
@@ -3962,7 +3962,7 @@ async function saveTelegramFileFromResponse({
             force: true
           });
         }
-        // 机器人收到的原文件必须按 document 保存，避免 sendPhoto 重新压缩图片。
+        // 机器人收到的原文件必须按 document 保存，避免 sendPhoto 重新压缩图片
         const uploaded = await uploadBlobToTelegram(
           chunk,
           fileName,
@@ -4060,10 +4060,13 @@ async function handleMediaUpload(
   sourceMessageId = null
 ) {
   const declaredSize = Number(file && file.file_size || 0);
+  
+  // 临时文件名（用于进度消息，稍后修正）
   let fileName = sanitizeTelegramFileName(
     file && file.file_name,
     `telegram_${sourceMessageId || Date.now()}.bin`
   );
+  
   const processingMessage = await sendMessage(
     chatId,
     `⏳ <b>准备上传</b>\n\n📄 ${escapeHtml(fileName)}\n${buildProgressBar(0)} 0.0%`,
@@ -4090,11 +4093,10 @@ async function handleMediaUpload(
 
     const cloudDownloadLimit = 20 * 1024 * 1024;
     if (!config.allowLargeBotDownloads && declaredSize > cloudDownloadLimit) {
-      throw new Error(
-        `文件超出官方限制`
-      );
+      throw new Error(`文件超出官方限制`);
     }
 
+    // 检查是否已存在（断点续传）
     const existingFile = await config.database.prepare(`
       SELECT * FROM files WHERE upload_id = ? AND chat_id = ? LIMIT 1
     `).bind(uploadId, chatId).first();
@@ -4110,6 +4112,7 @@ async function handleMediaUpload(
       return;
     }
 
+    // 获取 Telegram 文件信息
     await progress({ phase: '正在获取 Telegram 文件信息', force: true });
     const fileInfoResponse = await fetch(
       `${telegramMethodUrl(config.tgBotToken, 'getFile', config)}?file_id=${encodeURIComponent(file.file_id)}`
@@ -4122,26 +4125,52 @@ async function handleMediaUpload(
     const actualSize = Number(data.result.file_size || declaredSize || 0);
     if (!actualSize) throw new Error('Telegram 未返回有效文件大小');
     if (!config.allowLargeBotDownloads && actualSize > cloudDownloadLimit) {
-      throw new Error(
-        `文件为 ${formatSize(actualSize)}，超过官方限制；`
-      );
+      throw new Error(`文件为 ${formatSize(actualSize)}，超过官方限制；`);
     }
     if (actualSize > Number(config.maxSizeMB) * 1024 * 1024) {
       throw new Error(`文件超过 ${config.maxSizeMB}MB 业务限制`);
     }
 
-    let mimeType = file.mime_type || 'application/octet-stream';
+    // 根据 file_path 修正文件名和 MIME 类型（修复 .bin 问题）
     const filePath = data.result.file_path;
     const filePathExt = (String(filePath).split('.').pop() || '').toLowerCase();
-    let ext = fileName.includes('.')
-      ? (fileName.split('.').pop() || '').toLowerCase()
-      : filePathExt;
+
+    let mimeType = file.mime_type || 'application/octet-stream';
+    if (filePathExt) {
+      const guessedMime = getContentType(filePathExt);
+      if (guessedMime !== 'application/octet-stream') {
+        mimeType = guessedMime;
+      }
+    }
+    let ext = filePathExt;
     if (!ext) ext = getExtensionFromMime(mimeType);
-    if (!file.file_name) fileName = `file_${Date.now()}.${ext || 'bin'}`;
-    if (!mimeType || mimeType === 'application/octet-stream') {
-      mimeType = getContentType(ext || 'bin');
+    if (!ext) ext = 'bin';
+
+    // 修正文件名
+    if (!file.file_name) {
+      if (file.video_note) {
+        fileName = `video_note_${Date.now()}.${ext}`;
+      } else if (file.voice) {
+        fileName = `voice_message_${Date.now()}.${ext}`;
+      } else if (file.audio) {
+        fileName = (file.audio.title || `audio_${Date.now()}`) + `.${ext}`;
+      } else if (file.video) {
+        fileName = `video_${Date.now()}.${ext}`;
+      } else if (file.photo) {
+        fileName = `photo_${Date.now()}.${ext}`;
+      } else {
+        fileName = `file_${Date.now()}.${ext}`;
+      }
+    } else {
+      // 有原始文件名，但可能缺扩展名
+      if (!file.file_name.includes('.')) {
+        fileName = `${file.file_name}.${ext}`;
+      } else {
+        fileName = file.file_name;
+      }
     }
 
+    // 重新创建进度更新器（使用修正后的文件名和实际大小）
     progress = createUploadProgressUpdater(
       chatId,
       processingMessageId,
@@ -4151,6 +4180,7 @@ async function handleMediaUpload(
     );
     await progress({ phase: '正在下载并准备分片', force: true });
 
+    // 获取文件内容并存储
     const fileResponse = await fetchTelegramBinaryFile(
       file.file_id,
       filePath,
@@ -4189,7 +4219,6 @@ async function handleMediaUpload(
         completedChunks: 0,
         force: true
       });
-      // 保持与原版兼容：R2 路径仍使用 ArrayBuffer，避免未知长度流被 R2 拒绝。
       const r2Buffer = await fileResponse.arrayBuffer();
       await progress({
         phase: '正在写入 R2 存储',
@@ -4249,6 +4278,7 @@ async function handleMediaUpload(
         caption: `🔍 扫描二维码访问\n${saved.url}`
       })
     }).catch(error => console.warn('发送二维码失败:', error.message));
+
   } catch (error) {
     console.error('Error handling media upload:', error);
     const edited = await progress({ error: error.message, force: true });
@@ -4457,8 +4487,8 @@ const LARGE_UPLOAD_SESSION_STATUS = Object.freeze({
   FAILED: 'failed'
 });
 
-// 相邻两个成功分片之间最多允许间隔 10 分钟。
-// 该值按需求固定，不受 UPDATE_TIME（临时页面入口有效期）影响。
+// 相邻两个成功分片之间最多允许间隔 10 分钟
+// 该值按需求固定，不受 UPDATE_TIME（临时页面入口有效期）影响
 const LARGE_UPLOAD_CHUNK_TIMEOUT_MINUTES = 10;
 const LARGE_UPLOAD_CHUNK_TIMEOUT_MS =
   LARGE_UPLOAD_CHUNK_TIMEOUT_MINUTES * 60 * 1000;
@@ -4526,7 +4556,7 @@ async function createLargeUploadSession(chatId, userSetting, config) {
   const expiresAt = now + Number(config.updateTimeMinutes || 20) * 60 * 1000;
   const categoryId = Number(userSetting && userSetting.current_category_id) || null;
 
-  // 每次重新发送主菜单时废弃该用户尚未开始的旧入口；已开始/已完成任务不受影响。
+  // 每次重新发送主菜单时废弃该用户尚未开始的旧入口；已开始/已完成任务不受影响
   await config.database.prepare(`
     DELETE FROM bot_upload_sessions
     WHERE chat_id = ? AND status = ?
@@ -4608,7 +4638,7 @@ async function cancelLargeUploadSessionForChunkTimeout(session, config) {
   const totalChunks = Number(session.total_chunks || 0);
 
   // 未成功上传首片时由 UPDATE_TIME 控制入口有效期；所有分片都已到齐时
-  // 不再执行“分片间隔”取消，允许进入最终生成直链阶段。
+  // 不再执行“分片间隔”取消，允许进入最终生成直链阶段
   if (
     progress.uploadedChunks <= 0 ||
     !progress.lastChunkAt ||
@@ -4620,9 +4650,9 @@ async function cancelLargeUploadSessionForChunkTimeout(session, config) {
 
   const reason =
     `相邻分片上传间隔超过 ${LARGE_UPLOAD_CHUNK_TIMEOUT_MINUTES} 分钟，` +
-    '任务已取消，已上传分片已删除。';
+    '任务已取消，已上传分片已删除';
 
-  // 先原子地把任务改为 cancelled，阻止并发的下一片或完成请求继续落库。
+  // 先原子地把任务改为 cancelled，阻止并发的下一片或完成请求继续落库
   const updateResult = await config.database.prepare(`
     UPDATE bot_upload_sessions
     SET status = ?, error_message = ?, uploaded_chunks = 0, uploaded_bytes = 0
@@ -4641,7 +4671,7 @@ async function cancelLargeUploadSessionForChunkTimeout(session, config) {
     return { session: current || session, cancelled: false, deletedChunks: 0 };
   }
 
-  // 删除该 upload_id 下尚未绑定正式文件的全部 Telegram 分片与 D1 记录。
+  // 删除该 upload_id 下尚未绑定正式文件的全部 Telegram 分片与 D1 记录
   const deletedChunks = await abortPendingChunkUpload(
     session.upload_id,
     session.chat_id,
@@ -4652,7 +4682,7 @@ async function cancelLargeUploadSessionForChunkTimeout(session, config) {
     'SELECT * FROM bot_upload_sessions WHERE id = ? LIMIT 1'
   ).bind(session.id).first();
 
-  // 页面即使已经关闭，也通过机器人明确告知任务已被取消。
+  // 页面即使已经关闭，也通过机器人明确告知任务已被取消
   try {
     await sendMessage(
       session.chat_id,
@@ -4664,7 +4694,7 @@ async function cancelLargeUploadSessionForChunkTimeout(session, config) {
       `已清理分片：${deletedChunks} 个
 
 ` +
-      '请重新点击“上传大文件”创建新任务。',
+      '请重新点击“上传大文件”创建新任务',
       config.tgBotToken
     );
   } catch (notifyError) {
@@ -4683,8 +4713,8 @@ async function enforceLargeUploadChunkTimeout(session, config) {
   return result.session || session;
 }
 
-// 供 Cloudflare Cron Trigger 使用。网页关闭后仍能自动清理超过 10 分钟
-// 没有继续上传下一片的任务。
+// 供 Cloudflare Cron Trigger 使用网页关闭后仍能自动清理超过 10 分钟
+// 没有继续上传下一片的任务
 async function cleanupStaleLargeUploadSessions(config, limit = 100) {
   const cutoff = Date.now() - LARGE_UPLOAD_CHUNK_TIMEOUT_MS;
   const result = await config.database.prepare(`
@@ -4782,7 +4812,7 @@ async function handleLargeUploadPageRequest(request, config) {
   if (!session) {
     return new Response(generateLargeUploadMessagePage(
       '上传页面无效',
-      '该上传链接不存在或已被新的链接替换，请返回机器人重新点击“上传大文件”。'
+      '该上传链接不存在或已被新的链接替换，请返回机器人重新点击“上传大文件”'
     ), {
       status: 404,
       headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' }
@@ -4791,15 +4821,15 @@ async function handleLargeUploadPageRequest(request, config) {
 
   session = await enforceLargeUploadChunkTimeout(session, config);
 
-  // UPDATE_TIME 只限制仍未开始的入口。cancelled 会继续返回完整页面，
-  // 由前端显示取消原因并主动关闭，而不是被误判成普通过期页。
+  // UPDATE_TIME 只限制仍未开始的入口cancelled 会继续返回完整页面，
+  // 由前端显示取消原因并主动关闭，而不是被误判成普通过期页
   if (
     String(session.status || '') === LARGE_UPLOAD_SESSION_STATUS.PENDING &&
     isLargeUploadSessionExpired(session)
   ) {
     return new Response(generateLargeUploadMessagePage(
       '上传页面已过期',
-      `该页面在创建后 ${Number(config.updateTimeMinutes || 20)} 分钟内未开始上传，请返回机器人重新生成。`
+      `该页面在创建后 ${Number(config.updateTimeMinutes || 20)} 分钟内未开始上传，请返回机器人重新生成`
     ), {
       status: 410,
       headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' }
@@ -4952,8 +4982,8 @@ async function handleLargeUploadChunkRequest(request, config) {
       config
     );
 
-    // 上传 Telegram 分片期间，状态轮询或 Cron 可能刚好触发超时取消。
-    // 再次检查并清理刚刚完成的孤立分片，确保取消后不会残留。
+    // 上传 Telegram 分片期间，状态轮询或 Cron 可能刚好触发超时取消
+    // 再次检查并清理刚刚完成的孤立分片，确保取消后不会残留
     session = await config.database.prepare(
       'SELECT * FROM bot_upload_sessions WHERE id = ? LIMIT 1'
     ).bind(session.id).first();
@@ -5047,7 +5077,7 @@ async function handleLargeUploadCompleteRequest(request, config) {
       session.id
     ).run();
 
-    // 即使用户已经关闭临时网页，也会在机器人会话中收到永久直链。
+    // 即使用户已经关闭临时网页，也会在机器人会话中收到永久直链
     try {
       await sendMessage(
         session.chat_id,
@@ -6544,8 +6574,8 @@ function generateLargeUploadPage({
   <body>
     <main class="container">
       <h1>📤 上传大文件</h1>
-      <p class="subtitle">机器人专属临时页面 · 浏览器将文件按 ${Math.round(chunkSizeBytes / 1024 / 1024)} MB 分片保存到 Telegram。</p>
-      <div class="notice">页面在尚未开始上传时有效 ${Number(updateTimeMinutes)} 分钟。首个分片成功后不再受该时限影响；关闭页面不会删除已上传分片，完成后机器人也会发送永久直链。</div>
+      <p class="subtitle">机器人专属临时页面 · 浏览器将文件按 ${Math.round(chunkSizeBytes / 1024 / 1024)} MB 分片保存到 Telegram</p>
+      <div class="notice">页面在尚未开始上传时有效 ${Number(updateTimeMinutes)} 分钟首个分片成功后不再受该时限影响；关闭页面不会删除已上传分片，完成后机器人也会发送永久直链</div>
 
       <div class="field">
         <label for="categorySelect">选择分类</label>
@@ -6581,7 +6611,7 @@ function generateLargeUploadPage({
           <button id="copyButton" type="button" disabled>复制直链</button>
         </div>
       </section>
-      <div class="footer">临时页面失效或会话记录被清理，不会删除已经生成的文件和直链。</div>
+      <div class="footer">临时页面失效或会话记录被清理，不会删除已经生成的文件和直链</div>
     </main>
 
     <script>
@@ -6663,7 +6693,7 @@ function generateLargeUploadPage({
         fileInput.disabled = true;
         categorySelect.disabled = true;
 
-        // 先让用户看到取消原因，再尝试关闭 Telegram WebApp/内置浏览器页面。
+        // 先让用户看到取消原因，再尝试关闭 Telegram WebApp/内置浏览器页面
         setTimeout(() => {
           try {
             if (
@@ -6678,7 +6708,7 @@ function generateLargeUploadPage({
           try { window.close(); } catch (_) {}
 
           // 普通浏览器通常禁止脚本关闭非脚本打开的标签页，退化为返回上一页；
-          // 若仍无法返回，则清空当前页面，避免继续提交上传。
+          // 若仍无法返回，则清空当前页面，避免继续提交上传
           setTimeout(() => {
             try {
               if (history.length > 1) {
@@ -6688,7 +6718,7 @@ function generateLargeUploadPage({
             } catch (_) {}
             document.body.innerHTML =
               '<main style="font-family:sans-serif;padding:32px;text-align:center">' +
-              '<h2>上传任务已取消</h2><p>该页面已关闭，请返回 Telegram。</p></main>';
+              '<h2>上传任务已取消</h2><p>该页面已关闭，请返回 Telegram</p></main>';
           }, 300);
         }, 1800);
       }
@@ -6706,16 +6736,16 @@ function generateLargeUploadPage({
       function applyStatus(status) {
         if (!status) return;
         if (status.cancelled || status.status === 'cancelled' || status.closePage) {
-          const reason = status.error || '两个分片间隔超过 10 分钟，任务已取消，全部分片已删除。';
+          const reason = status.error || '两个分片间隔超过 10 分钟，任务已取消，全部分片已删除';
           setProgress(0, '任务已取消', '已清理该任务的全部 Telegram 分片');
-          setStatus(reason + ' 页面即将关闭。', 'error');
+          setStatus(reason + ' 页面即将关闭', 'error');
           closeCancelledPage();
           return;
         }
         if (status.resultUrl) {
           showResult(status.resultUrl);
-          setProgress(100, '上传完成', '直链已经生成，并已发送到机器人。');
-          setStatus('上传完成，可以复制直链。', 'success');
+          setProgress(100, '上传完成', '直链已经生成，并已发送到机器人');
+          setStatus('上传完成，可以复制直链', 'success');
           return;
         }
         if (status.fileName) {
@@ -6727,10 +6757,10 @@ function generateLargeUploadPage({
           setProgress(status.progress, status.status === 'finalizing' ? '正在生成直链' : '已有上传进度',
             formatSize(status.uploadedBytes) + ' / ' + formatSize(status.fileSize));
           const deadlineText = status.chunkDeadlineAt
-            ? '下一片须在 ' + new Date(status.chunkDeadlineAt).toLocaleTimeString() + ' 前完成。'
+            ? '下一片须在 ' + new Date(status.chunkDeadlineAt).toLocaleTimeString() + ' 前完成'
             : '';
           setStatus(
-            '页面关闭不会立即删除分片；若相邻分片超过 10 分钟，任务将自动取消并清理。' + deadlineText,
+            '页面关闭不会立即删除分片；若相邻分片超过 10 分钟，任务将自动取消并清理' + deadlineText,
             'info'
           );
         } else if (status.error) {
@@ -6769,7 +6799,7 @@ function generateLargeUploadPage({
       async function uploadFile(file) {
         if (busy) return;
         if (!file) return;
-        if (file.size <= 0) return setStatus('文件为空，无法上传。', 'error');
+        if (file.size <= 0) return setStatus('文件为空，无法上传', 'error');
         if (file.size > MAX_SIZE) return setStatus('文件超过最大限制：' + formatSize(MAX_SIZE), 'error');
         busy = true;
         clearStatus();
@@ -6789,7 +6819,7 @@ function generateLargeUploadPage({
             return;
           }
           if (latest.fileName && (latest.fileName !== file.name || Number(latest.fileSize) !== Number(file.size))) {
-            throw new Error('该页面已有另一个文件的上传进度，请重新从机器人生成页面。');
+            throw new Error('该页面已有另一个文件的上传进度，请重新从机器人生成页面');
           }
           const completed = new Set((latest.uploadedIndexes || []).map(Number));
           let uploadedBytes = Number(latest.uploadedBytes || 0);
@@ -6835,7 +6865,7 @@ function generateLargeUploadPage({
           }
           showResult(completeData.url);
           setProgress(100, '上传完成', '共 ' + completeData.chunkCount + ' 个分片');
-          setStatus('上传完成，直链已生成，同时已发送到机器人。', 'success');
+          setStatus('上传完成，直链已生成，同时已发送到机器人', 'success');
         } catch (error) {
           setStatus(error.message || '上传失败', 'error');
           const latest = await fetchStatus().catch(() => null);
@@ -6882,7 +6912,7 @@ function generateLargeUploadPage({
             const latest = await fetchStatus();
             applyStatus(latest);
           } catch (_) {
-            // 临时网络错误不打断正在进行的分片请求；下轮继续检查。
+            // 临时网络错误不打断正在进行的分片请求；下轮继续检查
           }
         }, 5000);
       }
