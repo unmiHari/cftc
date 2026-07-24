@@ -3796,33 +3796,6 @@ async function editTelegramTextMessage(chatId, messageId, text, config, replyMar
   return false;
 }
 
-async function deleteTelegramMessage(chatId, messageId, config) {
-  if (!messageId) return false;
-  try {
-    const response = await fetch(
-      telegramMethodUrl(config.tgBotToken, 'deleteMessage', config),
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          message_id: Number(messageId)
-        })
-      }
-    );
-    const data = await response.json().catch(() => null);
-    if (response.ok && data && data.ok) return true;
-    console.warn(
-      '删除 Telegram 进度消息失败:',
-      (data && data.description) || response.status
-    );
-    return false;
-  } catch (error) {
-    console.warn('删除 Telegram 进度消息出错:', error.message);
-    return false;
-  }
-}
-
 function buildUploadCompletedCaption({
   title = '上传完成',
   fileName,
@@ -6397,15 +6370,28 @@ async function resetWaitingState(
 async function deleteTelegramMessage(
   chatId,
   messageId,
-  botToken
+  botTokenOrConfig
 ) {
+  const telegramConfig =
+    botTokenOrConfig && typeof botTokenOrConfig === 'object'
+      ? botTokenOrConfig
+      : null;
+
+  const botToken = telegramConfig
+    ? telegramConfig.tgBotToken
+    : botTokenOrConfig;
+
   if (!chatId || !messageId || !botToken) {
     return false;
   }
 
   try {
     const response = await fetch(
-      telegramMethodUrl(botToken, 'deleteMessage'),
+      telegramMethodUrl(
+        botToken,
+        'deleteMessage',
+        telegramConfig
+      ),
       {
         method: 'POST',
         headers: {
@@ -6413,7 +6399,7 @@ async function deleteTelegramMessage(
         },
         body: JSON.stringify({
           chat_id: chatId,
-          message_id: messageId
+          message_id: Number(messageId)
         })
       }
     );
@@ -7478,7 +7464,7 @@ function generateUploadPage(categoryOptions, storageType) {
             <button onclick="copyUrls('html')">复制HTML</button>
           </div>
           <div class="copyright">
-            <span>© 2026 Copyright by <a href="https://github.com/unmiHari/cftc" target="_blank">unmiHari's GitHub</a> | <a href="https://awei.nyc.mn/" target="_blank">AWEI</a></span>
+            <span>© 2025 Copyright by <a href="https://github.com/iawooo/cftc" target="_blank">AWEI's GitHub</a> | <a href="https://awei.nyc.mn/" target="_blank">AWEI</a></span>
           </div>
         </div>
       </div>
