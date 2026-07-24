@@ -3796,6 +3796,103 @@ async function editTelegramTextMessage(chatId, messageId, text, config, replyMar
   return false;
 }
 
+async function deleteTelegramMessage(chatId, messageId, config) {
+  if (!messageId) return false;
+  try {
+    const response = await fetch(
+      telegramMethodUrl(config.tgBotToken, 'deleteMessage', config),
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: Number(messageId)
+        })
+      }
+    );
+    const data = await response.json().catch(() => null);
+    if (response.ok && data && data.ok) return true;
+    console.warn(
+      '删除 Telegram 进度消息失败:',
+      (data && data.description) || response.status
+    );
+    return false;
+  } catch (error) {
+    console.warn('删除 Telegram 进度消息出错:', error.message);
+    return false;
+  }
+}
+
+function buildUploadCompletedCaption({
+  title = '上传完成',
+  fileName,
+  fileSize,
+  url,
+  chunkCount = 0,
+  includeQrHint = true
+}) {
+  return `✅ <b>${escapeHtml(title)}</b>\n\n` +
+    `📄 文件：${escapeHtml(fileName)}\n` +
+    `📦 大小：${formatSize(Number(fileSize || 0))}\n` +
+    (Number(chunkCount || 0) > 1
+      ? `🧩 分片：${Number(chunkCount)} 个\n`
+      : '') +
+    `🔗 ${escapeHtml(url)}` +
+    (includeQrHint ? '\n\n🔍 扫描二维码访问' : '');
+}
+
+async function sendUploadCompletedWithQr({
+  chatId,
+  title = '上传完成',
+  fileName,
+  fileSize,
+  url,
+  chunkCount = 0
+}, config) {
+  const qrCodeUrl =
+    'https://api.qrserver.com/v1/create-qr-code/' +
+    `?size=320x320&data=${encodeURIComponent(url)}`;
+
+  const response = await fetch(
+    telegramMethodUrl(config.tgBotToken, 'sendPhoto', config),
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        photo: qrCodeUrl,
+        caption: buildUploadCompletedCaption({
+          title,
+          fileName,
+          fileSize,
+          url,
+          chunkCount
+        }),
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: '🔗 打开文件',
+                url
+              }
+            ]
+          ]
+        }
+      })
+    }
+  );
+
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data || !data.ok) {
+    throw new Error(
+      (data && data.description) ||
+      `Telegram sendPhoto 返回 HTTP ${response.status}`
+    );
+  }
+  return data;
+}
+
 function createUploadProgressUpdater(chatId, messageId, fileName, totalBytes, config) {
   const startedAt = Date.now();
   let lastEditAt = 0;
@@ -4101,14 +4198,34 @@ async function handleMediaUpload(
       SELECT * FROM files WHERE upload_id = ? AND chat_id = ? LIMIT 1
     `).bind(uploadId, chatId).first();
     if (existingFile) {
+      const existingSize = Number(existingFile.file_size || declaredSize);
       const existingChunks = Number(existingFile.chunk_count || 0);
       await progress({
-        processedBytes: Number(existingFile.file_size || declaredSize),
-        completedChunks: existingChunks,
+        phase: '正在生成二维码',
+        processedBytes: existingSize,
+        completedChunks: existingChunks || 1,
         totalChunks: Math.max(1, existingChunks),
-        finalUrl: existingFile.url,
         force: true
       });
+      try {
+        await sendUploadCompletedWithQr({
+          chatId,
+          fileName: existingFile.file_name || fileName,
+          fileSize: existingSize,
+          url: existingFile.url,
+          chunkCount: existingChunks
+        }, config);
+        await deleteTelegramMessage(chatId, processingMessageId, config);
+      } catch (notifyError) {
+        console.warn('发送合并上传完成消息失败:', notifyError.message);
+        await progress({
+          processedBytes: existingSize,
+          completedChunks: existingChunks || 1,
+          totalChunks: Math.max(1, existingChunks),
+          finalUrl: existingFile.url,
+          force: true
+        });
+      }
       return;
     }
 
@@ -4261,23 +4378,45 @@ async function handleMediaUpload(
     }
 
     await progress({
+      phase: '正在生成二维码',
       processedBytes: actualSize,
       completedChunks: saved.chunkCount || 1,
       totalChunks: saved.chunkCount || 1,
-      finalUrl: saved.url,
       force: true
     });
 
-    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(saved.url)}`;
-    await fetch(telegramMethodUrl(config.tgBotToken, 'sendPhoto', config), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        photo: qrCodeUrl,
-        caption: `🔍 扫描二维码访问\n${saved.url}`
-      })
-    }).catch(error => console.warn('发送二维码失败:', error.message));
+    try {
+      await sendUploadCompletedWithQr({
+        chatId,
+        fileName,
+        fileSize: actualSize,
+        url: saved.url,
+        chunkCount: saved.chunkCount || 0
+      }, config);
+      await deleteTelegramMessage(chatId, processingMessageId, config);
+    } catch (notifyError) {
+      console.warn('发送合并上传完成消息失败:', notifyError.message);
+      const edited = await progress({
+        processedBytes: actualSize,
+        completedChunks: saved.chunkCount || 1,
+        totalChunks: saved.chunkCount || 1,
+        finalUrl: saved.url,
+        force: true
+      });
+      if (!edited) {
+        await sendMessage(
+          chatId,
+          buildUploadCompletedCaption({
+            fileName,
+            fileSize: actualSize,
+            url: saved.url,
+            chunkCount: saved.chunkCount || 0,
+            includeQrHint: false
+          }),
+          config.tgBotToken
+        );
+      }
+    }
 
   } catch (error) {
     console.error('Error handling media upload:', error);
@@ -5077,19 +5216,30 @@ async function handleLargeUploadCompleteRequest(request, config) {
       session.id
     ).run();
 
-    // 即使用户已经关闭临时网页，也会在机器人会话中收到永久直链
+    // 即使用户已经关闭临时网页，也会在机器人会话中收到永久直链和二维码
     try {
+      await sendUploadCompletedWithQr({
+        chatId: session.chat_id,
+        title: '大文件上传完成',
+        fileName: session.file_name,
+        fileSize: Number(session.file_size || 0),
+        url: file.url,
+        chunkCount: Number(session.total_chunks || 0)
+      }, config);
+    } catch (notifyError) {
+      console.warn('发送大文件合并完成消息失败:', notifyError.message);
       await sendMessage(
         session.chat_id,
-        `✅ <b>大文件上传完成</b>\n\n` +
-        `📄 文件：${escapeHtml(session.file_name)}\n` +
-        `📦 大小：${formatSize(Number(session.file_size || 0))}\n` +
-        //`🧩 分片：${Number(session.total_chunks || 0)}\n\n` +
-        `🔗 ${escapeHtml(file.url)}`,
+        buildUploadCompletedCaption({
+          title: '大文件上传完成',
+          fileName: session.file_name,
+          fileSize: Number(session.file_size || 0),
+          url: file.url,
+          chunkCount: Number(session.total_chunks || 0),
+          includeQrHint: false
+        }),
         config.tgBotToken
       );
-    } catch (notifyError) {
-      console.warn('发送大文件完成通知失败:', notifyError.message);
     }
 
     return largeUploadJson({
@@ -7328,7 +7478,7 @@ function generateUploadPage(categoryOptions, storageType) {
             <button onclick="copyUrls('html')">复制HTML</button>
           </div>
           <div class="copyright">
-            <span>© 2025 Copyright by <a href="https://github.com/iawooo/cftc" target="_blank">AWEI's GitHub</a> | <a href="https://awei.nyc.mn/" target="_blank">AWEI</a></span>
+            <span>© 2026 Copyright by <a href="https://github.com/unmiHari/cftc" target="_blank">unmiHari's GitHub</a> | <a href="https://awei.nyc.mn/" target="_blank">AWEI</a></span>
           </div>
         </div>
       </div>
